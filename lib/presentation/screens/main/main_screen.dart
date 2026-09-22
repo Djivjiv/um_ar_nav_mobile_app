@@ -12,6 +12,7 @@ import '../../../core/utils/session_service.dart';
 import '../../bloc/auth/auth_cubit.dart';
 import '../../bloc/search/search_cubit.dart';
 import '../../widgets/search_bar_widget.dart';
+import '../temp/geo_reference_screen.dart'; // ⚠️ temporary georeferencing tool
 
 class _Tab {
   final String route;
@@ -25,6 +26,7 @@ const _tabs = [
   _Tab('/ar', Icons.view_in_ar, 'AR'),
   _Tab('/places', Icons.business, 'Places'),
   _Tab('/about', Icons.info_outline, 'About'),
+  _Tab('/geo', Icons.map_outlined, 'Geo'), // ⚠️ temporary georeferencing tool
 ];
 
 class MainScreen extends StatefulWidget {
@@ -142,7 +144,19 @@ class _MainScreenState extends State<MainScreen> {
     return Scaffold(
       bottomNavigationBar: _BottomNavBar(
         currentIndex: index,
-        onTap: (i) => context.go(_tabs[i].route),
+        onTap: (i) {
+          // ⚠️ The temporary "Geo" tool has no go_router route — it is a
+          // pushed screen, not one of the shell tabs.
+          if (_tabs[i].route == '/geo') {
+            Navigator.of(context, rootNavigator: true).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const GeoReferenceScreen(),
+              ),
+            );
+          } else {
+            context.go(_tabs[i].route);
+          }
+        },
       ),
       body: Stack(
         children: [
@@ -218,6 +232,7 @@ class _BottomNavBar extends StatelessWidget {
     [Icons.view_in_ar_outlined, Icons.view_in_ar],
     [Icons.business_outlined, Icons.business],
     [Icons.info_outline, Icons.info],
+    [Icons.map_outlined, Icons.map], // ⚠️ temporary georeferencing tool
   ];
 
   @override

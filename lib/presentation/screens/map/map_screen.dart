@@ -21,6 +21,9 @@ import '../../widgets/building_bottom_sheet.dart';
 import '../../widgets/navigation_path_painter.dart';
 import '../../widgets/route_info_panel.dart';
 import '../../widgets/um_map_widget.dart';
+import '../../../services/unity_bridge_service.dart';
+import '../ar/ar_navigation_screen.dart';
+import '../ar/unity_ar_screen.dart';
 import '../navigation/multi_phase_nav_screen.dart';
 import 'search_destination_page.dart';
 
@@ -153,6 +156,40 @@ class _MapScreenState extends State<MapScreen> {
     Navigator.of(context, rootNavigator: true).push(
       MaterialPageRoute<void>(
         builder: (_) => MultiPhaseNavScreen(navigationRoute: route),
+      ),
+    );
+  }
+
+  Future<void> _onStartARNavigation(OutdoorNavState navState) async {
+    if (!navState.hasRoute || navState.path.length < 2) return;
+    final fromName =
+        navState.from?.label ?? _selectedFrom?['name'] as String? ?? 'Start';
+    final toName = navState.to?.label ??
+        _selectedTo?['name'] as String? ??
+        'Destination';
+    final buildingId =
+        _selectedTo != null ? _buildingIdFor(_selectedTo!)?.toString() : null;
+    final useUnity = await UnityBridgeService.instance.isAvailable();
+    if (!mounted) return;
+
+    Navigator.of(context, rootNavigator: true).push(
+      MaterialPageRoute<void>(
+        builder: (_) => useUnity
+            ? UnityArScreen(
+                routePoints: navState.path,
+                buildingId: buildingId ?? '',
+                destinationName: toName,
+                fromName: fromName,
+                distanceMeters: navState.distanceMeters,
+                destinationLatLng: navState.path.last,
+              )
+            : ARNavigationScreen(
+                routePoints: navState.path,
+                fromName: fromName,
+                toName: toName,
+                distanceMeters: navState.distanceMeters,
+                destinationLatLng: navState.path.last,
+              ),
       ),
     );
   }
@@ -1363,6 +1400,7 @@ class _MapScreenState extends State<MapScreen> {
                     ? RouteInfoPanel(
                         state: navState,
                         onStart: () => _onStartNavigation(navState),
+                        onARNavigation: () => _onStartARNavigation(navState),
                         onClear: () =>
                             context.read<OutdoorNavCubit>().clearRoute(),
                       )

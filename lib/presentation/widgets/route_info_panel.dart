@@ -8,12 +8,14 @@ class RouteInfoPanel extends StatelessWidget {
   final OutdoorNavState state;
   final VoidCallback onStart;
   final VoidCallback onClear;
+  final VoidCallback? onARNavigation;
 
   const RouteInfoPanel({
     super.key,
     required this.state,
     required this.onStart,
     required this.onClear,
+    this.onARNavigation,
   });
 
   @override
@@ -70,23 +72,48 @@ class RouteInfoPanel extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 14),
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton(
-                  onPressed: state.hasRoute ? onStart : null,
-                  child: const Text('Start Navigation'),
-                ),
-              ),
-            ],
+          ElevatedButton.icon(
+            onPressed: state.hasRoute ? onStart : null,
+            icon: const Icon(Icons.navigation, color: AppColors.accentGold),
+            label: const Text('Start Navigation',
+                style: TextStyle(
+                    color: AppColors.accentGold,
+                    fontWeight: FontWeight.bold)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primaryMaroon,
+              minimumSize: const Size(double.infinity, 48),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
           ),
           const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton(
-              onPressed: onClear,
-              child: const Text('Clear Route'),
+          ElevatedButton.icon(
+            onPressed:
+                state.hasRoute ? (onARNavigation ?? () {}) : null,
+            icon: const Icon(Icons.view_in_ar,
+                color: AppColors.primaryMaroon),
+            label: const Text('AR Navigation',
+                style: TextStyle(
+                    color: AppColors.primaryMaroon,
+                    fontWeight: FontWeight.bold)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.accentGold,
+              minimumSize: const Size(double.infinity, 48),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton(
+            onPressed: onClear,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.primaryMaroon,
+              side: const BorderSide(color: AppColors.primaryMaroon),
+              minimumSize: const Size(double.infinity, 44),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+            child: const Text('Clear Route'),
           ),
         ],
       ),

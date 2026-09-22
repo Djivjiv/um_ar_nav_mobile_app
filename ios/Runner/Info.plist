@@ -9,7 +9,9 @@
 	<key>CFBundleDisplayName</key>
 	<string>UM-AR Nav</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Required for AR navigation</string>
+	<string>UM-AR Nav uses camera for AR navigation view</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>UM-AR Nav needs photo access to upload floor plan images</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>UM-AR Nav needs your location to verify you are inside the University of Mindanao Matina Campus.</string>
 	<key>NSLocationAlwaysUsageDescription</key>

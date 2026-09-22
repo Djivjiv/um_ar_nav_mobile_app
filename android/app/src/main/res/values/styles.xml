@@ -15,4 +15,14 @@
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
     </style>
+    <!-- Placeholder for UnityPlayerActivity's theme (AndroidManifest.xml).
+         Unity's own exported Android Library normally ships its own
+         UnityThemeSelector in its styles.xml; without this placeholder,
+         AAPT fails resource linking for the whole app with "resource
+         style/UnityThemeSelector not found" (confirmed by a real build).
+         App-module resources take priority over a library dependency's
+         same-named resource, so once the real Unity .aar (with its own
+         UnityThemeSelector) is added under android/unityLibrary, this entry
+         can be deleted — or left as-is with no conflict either way. -->
+    <style name="UnityThemeSelector" parent="@android:style/Theme.Black.NoTitleBar.Fullscreen"/>
 </resources>

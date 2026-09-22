@@ -43,3 +43,11 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// Only present once android/unityLibrary is a real Gradle module (see
+// settings.gradle.kts) — otherwise this project reference wouldn't resolve.
+if (rootProject.findProject(":unityLibrary") != null) {
+    dependencies {
+        implementation(project(":unityLibrary"))
+    }
+}

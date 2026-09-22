@@ -2,6 +2,15 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        // Only present once android/unityLibrary is a real Gradle module
+        // (see settings.gradle.kts) — it holds unityLibrary's own .jar/.aar
+        // dependencies under libs/.
+        val unityLibraryProject = rootProject.findProject(":unityLibrary")
+        if (unityLibraryProject != null) {
+            flatDir {
+                dirs("${unityLibraryProject.projectDir}/libs")
+            }
+        }
     }
 }
 

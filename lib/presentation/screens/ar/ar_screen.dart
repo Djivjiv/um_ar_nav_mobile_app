@@ -1,159 +1,174 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:flutter_compass/flutter_compass.dart';
 import 'package:go_router/go_router.dart';
+import 'package:latlong2/latlong.dart';
 
+import '../../../core/config/maptiler_config.dart';
 import '../../../core/constants/app_colors.dart';
-import '../../../domain/services/instruction_service.dart';
+import '../../../services/unity_bridge_service.dart';
 import '../../bloc/navigation/outdoor_nav_cubit.dart';
+import 'ar_navigation_screen.dart';
+import 'unity_ar_screen.dart';
 
-class ArScreen extends StatefulWidget {
+/// The AR tab — a launcher for the full-screen [ARNavigationScreen]. It shows
+/// the current route (if any) and starts AR guidance; with no route it can
+/// still open an AR compass pointed at the campus.
+class ArScreen extends StatelessWidget {
   const ArScreen({super.key});
 
-  @override
-  State<ArScreen> createState() => _ArScreenState();
-}
+  Future<void> _launch(BuildContext context, OutdoorNavState nav) async {
+    final hasRoute = nav.hasRoute && nav.path.length >= 2;
+    final routePoints = hasRoute ? nav.path : const <LatLng>[];
+    final fromName =
+        hasRoute ? (nav.from?.label ?? 'Your location') : 'Your location';
+    final toName =
+        hasRoute ? (nav.to?.label ?? 'Destination') : 'UM Matina Campus';
+    final distanceMeters = hasRoute ? nav.distanceMeters : 0.0;
+    final destinationLatLng =
+        hasRoute ? nav.path.last : MapTilerConfig.campusCenter;
+    final useUnity =
+        hasRoute && await UnityBridgeService.instance.isAvailable();
+    if (!context.mounted) return;
 
-class _ArScreenState extends State<ArScreen> {
-  double _heading = 0;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => useUnity
+            ? UnityArScreen(
+                routePoints: routePoints,
+                buildingId: nav.to?.buildingId?.toString() ?? '',
+                destinationName: toName,
+                fromName: fromName,
+                distanceMeters: distanceMeters,
+                destinationLatLng: destinationLatLng,
+              )
+            : ARNavigationScreen(
+                routePoints: routePoints,
+                fromName: fromName,
+                toName: toName,
+                distanceMeters: distanceMeters,
+                destinationLatLng: destinationLatLng,
+              ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return BlocBuilder<OutdoorNavCubit, OutdoorNavState>(
       builder: (context, nav) {
-        final hasRoute = nav.hasRoute && nav.instructions.isNotEmpty;
-        final step = hasRoute
-            ? nav.currentStep.clamp(0, nav.instructions.length - 1)
-            : 0;
-        final current = hasRoute ? nav.instructions[step] : null;
-        final next = hasRoute && step < nav.instructions.length - 1
-            ? nav.instructions[step + 1]
-            : null;
-
+        final hasRoute = nav.hasRoute && nav.path.length >= 2;
         return Scaffold(
-          backgroundColor: Colors.black,
-          body: Stack(
-            children: [
-              // Camera placeholder.
-              const Positioned.fill(
-                child: ColoredBox(
-                  color: Colors.black,
-                  child: Center(
-                    child: Icon(Icons.videocam_off_outlined,
-                        color: Colors.white24, size: 64),
+          backgroundColor: AppColors.backgroundGray,
+          body: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 110,
+                    height: 110,
+                    decoration: BoxDecoration(
+                      color: AppColors.primaryMaroon.withValues(alpha: 0.1),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.view_in_ar,
+                        size: 56, color: AppColors.primaryMaroon),
                   ),
-                ),
-              ),
-
-              // Directional arrow.
-              Center(
-                child: StreamBuilder<CompassEvent>(
-                  stream: FlutterCompass.events,
-                  builder: (context, snap) {
-                    _heading = snap.data?.heading ?? _heading;
-                    final target = current?.bearing ?? 0;
-                    final relative =
-                        ((target - _heading) * math.pi / 180);
-                    return Transform.rotate(
-                      angle: relative,
-                      child: Icon(
-                        current?.direction == 'arrive'
-                            ? Icons.location_on
-                            : Icons.navigation,
-                        size: 130,
-                        color: AppColors.accentGold,
-                      ),
-                    );
-                  },
-                ),
-              ),
-
-              // Top bar.
-              SafeArea(
-                child: Container(
-                  color: AppColors.primaryMaroon,
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 4, vertical: 4),
-                  child: Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.arrow_back,
-                            color: Colors.white),
-                        onPressed: () => context.go('/map'),
-                      ),
-                      const Text('AR Navigation',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w700)),
-                      const Spacer(),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: AppColors.accentGold,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Text('BETA',
-                            style: TextStyle(
-                                color: AppColors.primaryMaroon,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700)),
-                      ),
-                      const SizedBox(width: 8),
-                    ],
+                  const SizedBox(height: 20),
+                  const Text('AR Navigation',
+                      style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: AppColors.textPrimary)),
+                  const SizedBox(height: 8),
+                  Text(
+                    hasRoute
+                        ? 'Follow a floating arrow through your camera. '
+                            'Tilt the phone down any time to see the 2D map.'
+                        : 'Plan a route on the Map tab first, then come back '
+                            'here for a guided AR walk.',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        fontSize: 14,
+                        color: AppColors.textSecondary,
+                        height: 1.5),
                   ),
-                ),
-              ),
-
-              // Bottom panel.
-              Align(
-                alignment: Alignment.bottomCenter,
-                child: Container(
-                  width: double.infinity,
-                  color: AppColors.primaryMaroon.withValues(alpha: 0.92),
-                  padding: EdgeInsets.fromLTRB(
-                      20, 16, 20, MediaQuery.of(context).padding.bottom + 90),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        current?.instructionText ??
-                            'Set a destination on the map to start AR guidance.',
-                        textAlign: TextAlign.center,
+                  const SizedBox(height: 24),
+                  if (hasRoute)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        border:
+                            Border.all(color: AppColors.accentGold),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.route,
+                              color: AppColors.accentGold, size: 20),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.start,
+                              children: [
+                                Text(nav.to?.label ?? 'Destination',
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: AppColors.textPrimary)),
+                                Text(
+                                  '${nav.distanceMeters.toStringAsFixed(0)} m'
+                                  '  ·  ~${nav.walkMinutes} min walk',
+                                  style: const TextStyle(
+                                      fontSize: 12,
+                                      color: AppColors.textSecondary),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 24),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      onPressed: () => _launch(context, nav),
+                      icon: const Icon(Icons.camera_alt,
+                          color: AppColors.accentGold),
+                      label: Text(
+                        hasRoute
+                            ? 'Start AR Navigation'
+                            : 'Open AR Compass',
                         style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600),
+                            color: AppColors.accentGold,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16),
                       ),
-                      if (next != null) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          'Next: ${InstructionService.label(next.direction)}',
-                          style:
-                              const TextStyle(color: AppColors.accentGold),
-                        ),
-                      ],
-                      const SizedBox(height: 12),
-                      if (hasRoute)
-                        Text('Step ${step + 1} of ${nav.instructions.length}',
-                            style: const TextStyle(
-                                color: Colors.white70, fontSize: 12)),
-                      const SizedBox(height: 12),
-                      OutlinedButton(
-                        onPressed: () => context.go('/map'),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: const BorderSide(color: Colors.white54),
-                        ),
-                        child: const Text('Switch to 2D Map'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.primaryMaroon,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12)),
                       ),
-                    ],
+                    ),
                   ),
-                ),
+                  if (!hasRoute) ...[
+                    const SizedBox(height: 10),
+                    TextButton(
+                      onPressed: () => context.go('/map'),
+                      child: const Text('Go to Map',
+                          style:
+                              TextStyle(color: AppColors.primaryMaroon)),
+                    ),
+                  ],
+                ],
               ),
-            ],
+            ),
           ),
         );
       },

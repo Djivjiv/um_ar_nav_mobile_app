@@ -24,3 +24,18 @@ plugins {
 }
 
 include(":app")
+
+// Unity AR player, exported as an Android Library (.aar) and dropped in at
+// android/unityLibrary (see its README.txt). Only included once that export
+// actually exists — i.e. it has its own build.gradle(.kts) — otherwise this
+// is a no-op so `flutter build` / `flutter run` keep working with no Unity
+// module. Confirmed via a real build spike: unconditionally including an
+// empty placeholder directory here fails the whole app build with "No
+// matching variant of project :unityLibrary was found — No variants exist."
+val unityLibraryDir = File(rootDir, "unityLibrary")
+if (File(unityLibraryDir, "build.gradle").exists() ||
+    File(unityLibraryDir, "build.gradle.kts").exists()
+) {
+    include(":unityLibrary")
+    project(":unityLibrary").projectDir = unityLibraryDir
+}

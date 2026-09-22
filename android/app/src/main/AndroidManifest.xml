@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
+
     <application
         android:label="UM-AR Nav"
         android:name="${applicationName}"
@@ -36,6 +39,28 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <!-- Unity AR player activity. Launched explicitly (not via
+             intent-filter) from UnityBridge.kt once app code calls
+             startOutdoorNavigation / startIndoorNavigation. The
+             com.unity3d.player.UnityPlayerActivity class does not exist
+             yet — it ships inside Unity's exported Android Library (.aar).
+             This entry is inert until that .aar is added under
+             android/unityLibrary and wired into android/app/build.gradle;
+             Unity's own exported manifest fragment is typically merged in
+             automatically at that point too, so reconcile/drop this entry
+             then if Gradle's manifest merger flags a conflict. -->
+        <activity
+            android:name="com.unity3d.player.UnityPlayerActivity"
+            android:label="AR Navigation"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|fontScale|layoutDirection|density"
+            android:hardwareAccelerated="true"
+            android:theme="@style/UnityThemeSelector">
+            <meta-data android:name="unityplayer.UnityActivity" android:value="true" />
+        </activity>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
