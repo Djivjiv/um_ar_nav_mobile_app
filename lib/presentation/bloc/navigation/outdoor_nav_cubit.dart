@@ -20,20 +20,57 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
 
   OutdoorNavigationRepository get repo => _repo;
 
-  Future<void> ensureGraph() async {
+  /// Loads the outdoor graph if needed. Returns true when it is loaded.
+  ///
+  /// Callers must gate on this result, never on [state.status]: a previous
+  /// attempt's error would otherwise make every retry silently do nothing.
+  Future<bool> ensureGraph() async {
     if (_repo.isLoaded) {
       if (state.status == OutdoorNavStatus.idle) {
         emit(state.copyWith(status: OutdoorNavStatus.graphReady));
       }
-      return;
+      return true;
     }
     emit(state.copyWith(status: OutdoorNavStatus.loadingGraph, error: null));
     try {
       await _repo.loadGraph();
       emit(state.copyWith(status: OutdoorNavStatus.graphReady));
+      return true;
     } on RepositoryException catch (e) {
       emit(state.copyWith(status: OutdoorNavStatus.error, error: e.message));
+      return false;
     }
+  }
+
+  /// Error shown when a route has no known starting point.
+  static const String noStartPointMessage =
+      'Choose a starting point — your location is not available.';
+
+  /// The graph node nearest [point], or null when the graph is empty or the
+  /// nearest node is more than [maxMeters] away (e.g. GPS far off campus).
+  String? nearestNodeIdWithin(LatLng point, double maxMeters) {
+    final n = _repo.nearestNode(point.latitude, point.longitude);
+    if (n == null) return null;
+    final d = const Distance().as(LengthUnit.Meter, point, n.point);
+    return d <= maxMeters ? n.id : null;
+  }
+
+  /// A start node for a trip leaving [building]: its entrance nearest
+  /// [towards] (the destination), else any entrance, else the graph node
+  /// nearest the building's own position. Null when the graph is empty.
+  String? startNodeForBuilding(BuildingModel building, {LatLng? towards}) {
+    final entrances = _repo.nodes
+        .where((n) => n.buildingId == building.id && n.isEntrance)
+        .toList();
+    if (entrances.isNotEmpty) {
+      if (towards == null) return entrances.first.id;
+      const distance = Distance();
+      entrances.sort((a, b) => distance
+          .as(LengthUnit.Meter, a.point, towards)
+          .compareTo(distance.as(LengthUnit.Meter, b.point, towards)));
+      return entrances.first.id;
+    }
+    return _repo.nearestNode(building.lat, building.lng)?.id;
   }
 
   void setFrom(NavEndpoint endpoint) => emit(state.copyWith(from: endpoint));
@@ -44,33 +81,29 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
     emit(state.copyWith(from: state.to, to: state.from));
   }
 
-  /// Convenience: start a route to a building from the nearest graph node
-  /// (or from an explicit origin node when provided).
+  /// Starts a route to [building] from [fromNodeId], else from the graph
+  /// node nearest [fromPoint] (the user's GPS position). With neither it
+  /// emits [noStartPointMessage] — it never guesses a start. UI callers use
+  /// `startRouteToBuilding` (GPS, else ask the user).
   Future<void> routeToBuilding(BuildingModel building,
-      {String? fromNodeId, LatLng? fromPoint}) async {
-    await ensureGraph();
-    if (state.status == OutdoorNavStatus.error) return;
+      {String? fromNodeId, LatLng? fromPoint, String? fromLabel}) async {
+    if (!await ensureGraph()) return;
 
-    String? startId = fromNodeId;
-    if (startId == null) {
-      final LatLng? origin = fromPoint ?? state.from?.point;
-      if (origin != null) {
-        startId = _repo.nearestNode(origin.latitude, origin.longitude)?.id;
-      } else if (_repo.nodes.isNotEmpty) {
-        startId = _repo.nodes.first.id;
-      }
-    }
-    if (startId == null) {
+    final startId = fromNodeId ??
+        (fromPoint == null
+            ? null
+            : _repo.nearestNode(fromPoint.latitude, fromPoint.longitude)?.id);
+    final startNode = startId == null
+        ? null
+        : _repo.nodes.where((n) => n.id == startId).firstOrNull;
+    if (startNode == null) {
       emit(state.copyWith(
-          status: OutdoorNavStatus.error,
-          error: 'No starting point available.'));
+          status: OutdoorNavStatus.error, error: noStartPointMessage));
       return;
     }
 
-    final startNode = _repo.nodes.firstWhere((n) => n.id == startId,
-        orElse: () => _repo.nodes.first);
     setFrom(NavEndpoint(
-      label: startNode.name ?? 'Current location',
+      label: fromLabel ?? startNode.name ?? 'Current location',
       nodeId: startNode.id,
       point: startNode.point,
     ));
@@ -78,7 +111,7 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
 
     emit(state.copyWith(status: OutdoorNavStatus.computing, error: null));
     final result = DijkstraService.findPathToBuilding(
-      startNodeId: startId,
+      startNodeId: startNode.id,
       buildingId: building.id,
       nodes: _repo.nodes,
       edges: _repo.edges,
@@ -94,6 +127,9 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
     required String toNodeId,
     String? fromName,
     String? toName,
+    String? toType,
+    String? toId,
+    int? toBuildingId,
   }) async {
     await ensureGraph();
 
@@ -117,7 +153,13 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
 
     emit(state.copyWith(
       from: NavEndpoint(label: fromName ?? 'Start', nodeId: fromNodeId),
-      to: NavEndpoint(label: toName ?? 'Destination', nodeId: toNodeId),
+      to: NavEndpoint(
+        label: toName ?? 'Destination',
+        nodeId: toNodeId,
+        placeType: toType,
+        placeId: toId,
+        placeBuildingId: toBuildingId,
+      ),
       status: OutdoorNavStatus.computing,
       error: null,
     ));
@@ -179,8 +221,7 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
           error: 'Choose both a start and a destination.'));
       return;
     }
-    await ensureGraph();
-    if (state.status == OutdoorNavStatus.error) return;
+    if (!await ensureGraph()) return;
 
     if (from.nodeId == null) {
       emit(state.copyWith(
@@ -210,6 +251,48 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
     _applyResult(result, destinationName: to.label);
   }
 
+  /// Recomputes the current route from the graph node nearest [position]
+  /// to the same destination (used by AR navigation when the user is off
+  /// the route). Returns true when a new route is ready.
+  Future<bool> rerouteFrom(LatLng position) async {
+    final to = state.to;
+    if (to == null) return false;
+    await ensureGraph();
+    final start = _repo.nearestNode(position.latitude, position.longitude);
+    if (start == null) return false;
+
+    if (to.nodeId != null) {
+      await findRouteBetween(
+        fromNodeId: start.id,
+        toNodeId: to.nodeId!,
+        fromName: 'Current location',
+        toName: to.label,
+        toType: to.placeType,
+        toId: to.placeId,
+        toBuildingId: to.placeBuildingId,
+      );
+    } else if (to.buildingId != null) {
+      emit(state.copyWith(
+        from: NavEndpoint(
+            label: 'Current location', nodeId: start.id, point: start.point),
+        status: OutdoorNavStatus.computing,
+        error: null,
+      ));
+      _applyResult(
+        DijkstraService.findPathToBuilding(
+          startNodeId: start.id,
+          buildingId: to.buildingId,
+          nodes: _repo.nodes,
+          edges: _repo.edges,
+        ),
+        destinationName: to.label,
+      );
+    } else {
+      return false;
+    }
+    return state.hasRoute;
+  }
+
   void _applyResult(PathResult? result, {required String destinationName}) {
     if (result == null || result.points.length < 2) {
       emit(state.copyWith(
@@ -225,6 +308,7 @@ class OutdoorNavCubit extends Cubit<OutdoorNavState> {
     emit(state.copyWith(
       status: OutdoorNavStatus.routeReady,
       path: result.points,
+      pathNodeIds: result.nodeIds,
       instructions: instructions,
       distanceMeters: result.distanceMeters,
       walkMinutes: (result.distanceMeters / _walkSpeed / 60).ceil(),

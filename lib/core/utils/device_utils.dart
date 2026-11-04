@@ -1,25 +1,35 @@
-import 'dart:math';
-
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Stable per-install identifier used for visitor sessions.
+import 'uuid.dart';
+
+/// Stable per-install identifier, shared by visitor sessions, trips and SUS.
 class DeviceUtils {
   DeviceUtils._();
 
-  static const _key = 'device_id';
+  static const _deviceCodeKey = 'device_code';
 
-  static Future<String> getDeviceId() async {
-    final prefs = await SharedPreferences.getInstance();
-    var deviceId = prefs.getString(_key);
+  static Future<String>? _deviceCode;
 
-    if (deviceId == null) {
-      final random = Random();
-      deviceId = 'device-'
-          '${DateTime.now().millisecondsSinceEpoch}-'
-          '${random.nextInt(999999)}';
-      await prefs.setString(_key, deviceId);
+  /// The evaluation data's `device_code`: a random UUID made once per install
+  /// and kept on the device. It comes from no hardware id, name, email or
+  /// location, so it says nothing about the person.
+  static Future<String> getDeviceCode() => _deviceCode ??= _loadDeviceCode();
+
+  static Future<String> _loadDeviceCode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_deviceCodeKey);
+      if (isUuid(saved)) return saved!;
+      final code = uuidV4();
+      await prefs.setString(_deviceCodeKey, code);
+      return code;
+    } catch (_) {
+      _deviceCode = null; // try again next time
+      rethrow;
     }
-
-    return deviceId;
   }
+
+  @visibleForTesting
+  static void resetDeviceCode() => _deviceCode = null;
 }

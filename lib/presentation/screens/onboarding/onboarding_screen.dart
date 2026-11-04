@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:smooth_page_indicator/smooth_page_indicator.dart';
 
 import '../../../core/constants/app_colors.dart';
+import '../../../core/constants/visitor_text.dart';
 
 class _Page {
   final IconData icon;
@@ -18,9 +19,10 @@ const _pages = [
   _Page(Icons.view_in_ar_rounded, 'AR Directions',
       'Point your camera and follow the arrows to your destination'),
   _Page(Icons.meeting_room_rounded, 'Indoor Floor Plans',
-      'Explore building interiors with detailed floor plans and room information'),
+      'Log in with your UM account to explore building interiors with detailed floor plans'),
   _Page(Icons.rocket_launch_rounded, 'Ready to Explore?',
-      'Login with your school email or continue as visitor'),
+      'Log in with your UM account, or continue as a visitor. '
+      '${VisitorText.access}'),
 ];
 
 class OnboardingScreen extends StatefulWidget {

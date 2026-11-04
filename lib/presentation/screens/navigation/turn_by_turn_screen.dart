@@ -11,6 +11,8 @@ import '../../../core/constants/app_colors.dart';
 import '../../../domain/services/instruction_service.dart';
 import '../../bloc/navigation/outdoor_nav_cubit.dart';
 import '../../routes/app_router.dart';
+import '../../widgets/arrival_feedback.dart';
+import '../../widgets/exit_navigation_dialog.dart';
 import '../../widgets/navigation_path_painter.dart';
 import '../../widgets/um_map_widget.dart';
 
@@ -24,12 +26,21 @@ class TurnByTurnScreen extends StatefulWidget {
   final String? destBuildingName;
   final VoidCallback? onArrivedAtBuilding;
 
+  /// Called when the user steps onto the final (arrival) step of a trip
+  /// with no further phases.
+  final VoidCallback? onArrived;
+
+  /// `navigation_sessions.trip_id` of this trip, if it is logged.
+  final String? tripId;
+
   const TurnByTurnScreen({
     super.key,
     this.args,
     this.hasMorePhases = false,
     this.destBuildingName,
     this.onArrivedAtBuilding,
+    this.onArrived,
+    this.tripId,
   });
 
   @override
@@ -127,6 +138,7 @@ class _TurnByTurnScreenState extends State<TurnByTurnScreen>
         context.read<OutdoorNavCubit>().nextStep();
       }
       _animateCameraToCurrentStep();
+      if (_isLastStep && !widget.hasMorePhases) widget.onArrived?.call();
     }
   }
 
@@ -355,9 +367,9 @@ class _TurnByTurnScreenState extends State<TurnByTurnScreen>
                       IconButton(
                         icon: const Icon(Icons.arrow_back,
                             color: AppColors.primaryMaroon),
-                        onPressed: () => context.pop(),
+                        onPressed: () => _confirmAndExit(context),
                       ),
-                      const Text('AR Navigation',
+                      const Text('Turn-by-Turn',
                           style: TextStyle(
                               fontWeight: FontWeight.w700,
                               color: AppColors.primaryMaroon)),
@@ -430,7 +442,10 @@ class _TurnByTurnScreenState extends State<TurnByTurnScreen>
                 child: isArrival && !widget.hasMorePhases
                     ? _ArrivalPanel(
                         name: current.landmark,
-                        onSurvey: () => context.push('/survey'),
+                        tripId: widget.tripId,
+                        onSurvey: () async {
+                          await context.push('/survey');
+                        },
                         onDone: () => _returnToMap(context),
                       )
                     : _BottomPanel(
@@ -484,6 +499,15 @@ class _TurnByTurnScreenState extends State<TurnByTurnScreen>
         );
       },
     );
+  }
+
+  /// Back arrow: same "Exit Navigation?" confirmation as the other
+  /// navigation screens. `Navigator.pop` (not `maybePop`) so that, when this
+  /// screen is embedded in MultiPhaseNavScreen, its PopScope doesn't ask a
+  /// second time.
+  Future<void> _confirmAndExit(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    if (await confirmExitNavigation(context)) navigator.pop();
   }
 
   /// Dismiss whatever is stacked on top of the map (this screen may be a
@@ -808,11 +832,13 @@ class _BottomPanelState extends State<_BottomPanel> {
 
 class _ArrivalPanel extends StatelessWidget {
   final String name;
-  final VoidCallback onSurvey;
+  final String? tripId;
+  final Future<void> Function() onSurvey;
   final VoidCallback onDone;
 
   const _ArrivalPanel({
     required this.name,
+    required this.tripId,
     required this.onSurvey,
     required this.onDone,
   });
@@ -842,9 +868,13 @@ class _ArrivalPanel extends StatelessWidget {
                   color: AppColors.textSecondary,
                   fontWeight: FontWeight.w600)),
           const SizedBox(height: 20),
-          ElevatedButton(
-              onPressed: onSurvey,
-              child: const Text('Rate your experience')),
+          ArrivalFeedback(
+            tripId: tripId,
+            onRate: onSurvey,
+            rateButton: (onPressed) => ElevatedButton(
+                onPressed: onPressed,
+                child: const Text('Rate your experience')),
+          ),
           const SizedBox(height: 8),
           OutlinedButton(
               onPressed: onDone, child: const Text('Return to Map')),

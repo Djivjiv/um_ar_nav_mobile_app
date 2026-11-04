@@ -14,7 +14,10 @@ class FloorPlanModel {
   final double? centerLat, centerLng;
   final double rotationAngle;
   final double scaleFactor;
-  final bool isGeoreferenced;
+
+  /// `building_floors.meters_per_pixel` (written by the admin app). Null when
+  /// the column is missing or empty.
+  final double? metersPerPixel;
   final bool isActive;
 
   const FloorPlanModel({
@@ -35,9 +38,42 @@ class FloorPlanModel {
     this.centerLng,
     this.rotationAngle = 0,
     this.scaleFactor = 1,
-    this.isGeoreferenced = false,
+    this.metersPerPixel,
     this.isActive = true,
   });
+
+  /// Used when a floor carries no usable scale.
+  static const double defaultMetersPerPixel = 0.05;
+
+  /// Metres per floor-plan pixel for this floor — see [resolveMetersPerPixel].
+  double get effectiveMetersPerPixel => resolveMetersPerPixel(
+      metersPerPixel: metersPerPixel, scaleFactor: scaleFactor);
+
+  /// `meters_per_pixel` when positive, else the legacy `scale_factor` when it
+  /// looks like a metres-per-pixel value (between 0 and 0.5 — older rows hold
+  /// 1.0 there), else [defaultMetersPerPixel].
+  static double resolveMetersPerPixel({
+    double? metersPerPixel,
+    double? scaleFactor,
+  }) {
+    if (metersPerPixel != null &&
+        metersPerPixel.isFinite &&
+        metersPerPixel > 0) {
+      return metersPerPixel;
+    }
+    if (scaleFactor != null && scaleFactor > 0 && scaleFactor < 0.5) {
+      return scaleFactor;
+    }
+    return defaultMetersPerPixel;
+  }
+
+  /// [resolveMetersPerPixel] for a raw `building_floors` row. Absent columns
+  /// read as null, so a database without `meters_per_pixel` still works.
+  static double metersPerPixelFromRow(Map<String, dynamic> row) =>
+      resolveMetersPerPixel(
+        metersPerPixel: J.dbl(row['meters_per_pixel']),
+        scaleFactor: J.dbl(row['scale_factor']),
+      );
 
   String get tabLabel {
     if (floorName != null && floorName!.trim().isNotEmpty) return floorName!;
@@ -83,7 +119,7 @@ class FloorPlanModel {
       centerLng: J.dbl(m['center_lng']),
       rotationAngle: J.dblOr(m['rotation_angle']),
       scaleFactor: J.dblOr(m['scale_factor'], 1),
-      isGeoreferenced: J.boolOr(m['is_georeferenced']),
+      metersPerPixel: J.dbl(m['meters_per_pixel']),
       isActive: J.boolOr(m['is_active'], true),
     );
   }

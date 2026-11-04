@@ -3,12 +3,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' hide AuthState;
 
+import '../../../core/config/app_config.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/constants/visitor_text.dart';
 import '../../../core/utils/session_service.dart';
+import '../../../data/models/feedback_person.dart';
 import '../../bloc/auth/auth_cubit.dart';
+import '../../widgets/feedback_comment_card.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -20,7 +23,6 @@ class ProfileScreen extends StatefulWidget {
 class _ProfileScreenState extends State<ProfileScreen> {
   Timer? _timer;
   bool _notifications = true;
-  String? _visitorSessionId;
 
   String? get _userId => Supabase.instance.client.auth.currentUser?.id;
 
@@ -29,11 +31,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     super.initState();
     _timer = Timer.periodic(
         const Duration(seconds: 1), (_) => setState(() {}));
-    SharedPreferences.getInstance().then((p) {
-      if (mounted) {
-        setState(() => _visitorSessionId = p.getString('visitor_session_id'));
-      }
-    });
   }
 
   @override
@@ -187,6 +184,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
               },
             ),
           ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: ProfileCommentEntry(person: FeedbackPerson.user(u)),
+        ),
         _card([
           SwitchListTile(
             secondary: const Icon(Icons.notifications_outlined),
@@ -194,7 +195,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             value: _notifications,
             onChanged: (v) => setState(() => _notifications = v),
           ),
-          _tile(Icons.info_outline, 'App version', '1.0.0'),
+          _tile(Icons.info_outline, 'App version', AppConfig.appVersion),
         ]),
         Padding(
           padding: const EdgeInsets.all(16),
@@ -241,53 +242,26 @@ class _ProfileScreenState extends State<ProfileScreen> {
           ),
         ),
         const SizedBox(height: 20),
-        if (_visitorSessionId != null)
-          FutureBuilder<int>(
-            future: SessionService.getVisitorRemainingMinutes(
-                _visitorSessionId!),
-            builder: (context, snapshot) {
-              final minutes = snapshot.data ?? 0;
-              final h = minutes ~/ 60;
-              final m = minutes % 60;
-              return Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFFF8E7),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppColors.accentGold),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.timer,
-                        color: AppColors.accentGold, size: 20),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Session expires in: ${h}h ${m}m',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            },
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFFFF8E7),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppColors.accentGold),
           ),
+          child: const Text(
+            VisitorText.access,
+            style: TextStyle(fontSize: 13, color: AppColors.textPrimary),
+          ),
+        ),
         const SizedBox(height: 12),
         _card([
-          _tile(Icons.lock_outline, 'Access level', 'Building-level only'),
-          _tile(Icons.info_outline, 'App version', '1.0.0'),
+          _tile(Icons.info_outline, 'App version', AppConfig.appVersion),
         ]),
         const SizedBox(height: 12),
         ElevatedButton(
           onPressed: () => context.go('/login'),
-          child: const Text('Login with School Email'),
-        ),
-        const SizedBox(height: 8),
-        OutlinedButton(
-          onPressed: () => context.go('/register'),
-          child: const Text('Register Account'),
+          child: const Text('Log in with your UM account'),
         ),
       ],
     );

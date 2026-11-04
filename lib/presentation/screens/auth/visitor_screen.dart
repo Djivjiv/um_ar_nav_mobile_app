@@ -5,6 +5,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../core/constants/app_colors.dart';
+import '../../../core/constants/visitor_text.dart';
 import '../../../core/utils/geofence_service.dart';
 import '../../bloc/auth/auth_cubit.dart';
 
@@ -15,28 +16,19 @@ class VisitorScreen extends StatefulWidget {
   State<VisitorScreen> createState() => _VisitorScreenState();
 }
 
-class _VisitorScreenState extends State<VisitorScreen> {
+class _VisitorScreenState extends State<VisitorScreen> with CampusGate {
   Timer? _timer;
   Duration _remaining = const Duration(hours: 2);
-  bool _gating = false;
-
-  Future<void> _gateToMap() async {
-    if (_gating) return;
-    _gating = true;
-    final inside = await GeofenceService.gate(context);
-    if (inside && mounted) context.go('/map');
-    _gating = false;
-  }
 
   @override
   void initState() {
     super.initState();
-    // Kick off session creation if not already a visitor.
+    // Kick off session creation unless one is already running.
     final state = context.read<AuthCubit>().state;
-    if (state is! AuthVisitor) {
-      context.read<AuthCubit>().continueAsVisitor();
-    } else {
+    if (state is AuthVisitor && state.session.isStillValid) {
       _startTimer(state);
+    } else {
+      context.read<AuthCubit>().continueAsVisitor();
     }
   }
 
@@ -50,6 +42,7 @@ class _VisitorScreenState extends State<VisitorScreen> {
       });
       if (_remaining <= Duration.zero) {
         _timer?.cancel();
+        context.read<AuthCubit>().checkVisitorSession();
       }
     });
   }
@@ -61,7 +54,7 @@ class _VisitorScreenState extends State<VisitorScreen> {
   }
 
   String get _formatted {
-    final d = _remaining.isNegative ? Duration.zero : _remaining;
+    final d = _remaining;
     final h = d.inHours.toString().padLeft(2, '0');
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
@@ -82,7 +75,8 @@ class _VisitorScreenState extends State<VisitorScreen> {
           }
         },
         builder: (context, state) {
-          final loading = state is AuthLoading;
+          final failed = state is AuthError;
+          final ready = state is AuthVisitor && _remaining > Duration.zero;
           return Padding(
             padding: const EdgeInsets.all(28),
             child: Column(
@@ -96,10 +90,16 @@ class _VisitorScreenState extends State<VisitorScreen> {
                         fontSize: 20, fontWeight: FontWeight.w700),
                     textAlign: TextAlign.center),
                 const SizedBox(height: 8),
-                const Text('Your session expires in 2 hours',
+                const Text('Your session time left',
                     style: TextStyle(color: AppColors.textSecondary)),
                 const SizedBox(height: 24),
-                if (loading)
+                if (failed)
+                  TextButton(
+                    onPressed: () =>
+                        context.read<AuthCubit>().continueAsVisitor(),
+                    child: const Text('Try again'),
+                  )
+                else if (!ready)
                   const CircularProgressIndicator()
                 else
                   Text(
@@ -119,23 +119,20 @@ class _VisitorScreenState extends State<VisitorScreen> {
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: const Text(
-                    'Visitor access is limited to building-level information. '
-                    'Sign in with a school email for full indoor navigation '
-                    'and room details.',
+                    VisitorText.access,
                     style: TextStyle(
                         color: AppColors.textSecondary, fontSize: 13),
                   ),
                 ),
                 const SizedBox(height: 24),
                 ElevatedButton(
-                  onPressed:
-                      (state is AuthVisitor) ? _gateToMap : null,
+                  onPressed: ready ? gateToMap : null,
                   child: const Text('Continue to Map'),
                 ),
                 const SizedBox(height: 10),
                 TextButton(
                   onPressed: () => context.go('/login'),
-                  child: const Text('Have a school email? Login'),
+                  child: const Text('Log in with your UM account'),
                 ),
               ],
             ),

@@ -26,6 +26,8 @@ class ArScreen extends StatelessWidget {
     final distanceMeters = hasRoute ? nav.distanceMeters : 0.0;
     final destinationLatLng =
         hasRoute ? nav.path.last : MapTilerConfig.campusCenter;
+    final to = nav.to;
+    final buildingId = to?.placeBuildingId ?? to?.buildingId;
     final useUnity =
         hasRoute && await UnityBridgeService.instance.isAvailable();
     if (!context.mounted) return;
@@ -35,11 +37,12 @@ class ArScreen extends StatelessWidget {
         builder: (_) => useUnity
             ? UnityArScreen(
                 routePoints: routePoints,
-                buildingId: nav.to?.buildingId?.toString() ?? '',
+                buildingId: buildingId?.toString() ?? '',
                 destinationName: toName,
                 fromName: fromName,
                 distanceMeters: distanceMeters,
                 destinationLatLng: destinationLatLng,
+                routeNodeIds: nav.pathNodeIds,
               )
             : ARNavigationScreen(
                 routePoints: routePoints,
@@ -47,6 +50,11 @@ class ArScreen extends StatelessWidget {
                 toName: toName,
                 distanceMeters: distanceMeters,
                 destinationLatLng: destinationLatLng,
+                routeNodeIds: hasRoute ? nav.pathNodeIds : const [],
+                destinationBuildingId: buildingId,
+                // Room / facility destinations get their own info card.
+                destinationType: hasRoute ? to?.placeType : null,
+                destinationId: hasRoute ? to?.placeId : null,
               ),
       ),
     );

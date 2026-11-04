@@ -8,6 +8,7 @@ import '../../../core/config/app_config.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/geofence_service.dart';
 import '../../bloc/auth/auth_cubit.dart';
+import '../../routes/app_router.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -116,6 +117,14 @@ class _SplashScreenState extends State<SplashScreen>
 
     if (needsRole) {
       context.go('/select-role');
+      return;
+    }
+    if (authState is AuthAccountBlocked) {
+      context.go('/account-status');
+      return;
+    }
+    if (authState is AuthVisitorEnded) {
+      context.go(AppRouter.visitorEndedRoute);
       return;
     }
 

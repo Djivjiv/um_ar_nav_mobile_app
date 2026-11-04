@@ -6,6 +6,7 @@ import '../../core/constants/app_colors.dart';
 import '../../core/utils/building_icon_map.dart';
 import '../../data/models/building_model.dart';
 import '../bloc/building/building_cubit.dart';
+import 'floor_plans_button.dart';
 import 'loading_skeleton.dart';
 
 /// Buildings that have no rooms (gates, courts, small offices) — the "Floors"
@@ -115,6 +116,7 @@ class BuildingBottomSheet extends StatelessWidget {
                     icon: const Icon(Icons.directions),
                     label: const Text('Navigate Here'),
                   ),
+                  FloorPlansButton(buildingId: building.id),
                   const SizedBox(height: 16),
                   if (loading) const LoadingSkeleton(height: 40),
                   if (state.selectedFacilities.isNotEmpty) ...[

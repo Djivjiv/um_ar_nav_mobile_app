@@ -6,8 +6,11 @@ import 'package:latlong2/latlong.dart';
 
 import '../../core/config/maptiler_config.dart';
 import '../../core/constants/app_colors.dart';
+import '../../core/network/connectivity_service.dart';
+import '../../data/local/campus_tile_cache.dart';
 import '../../data/models/building_model.dart';
 import 'building_label_marker.dart';
+import 'campus_tile_provider.dart';
 
 /// Shared FlutterMap wrapper: MapTiler base + UM overlay, cached tiles,
 /// constrained camera, rotation disabled, and Google-Maps-style building
@@ -28,6 +31,9 @@ class UmMapWidget extends StatefulWidget {
   final VoidCallback? onMapReady;
   final void Function(MapCamera camera)? onCameraChanged;
 
+  /// Defaults to [ConnectivityService.instance].
+  final ConnectivityService? connectivity;
+
   const UmMapWidget({
     super.key,
     required this.controller,
@@ -41,6 +47,7 @@ class UmMapWidget extends StatefulWidget {
     this.showLabels = true,
     this.onMapReady,
     this.onCameraChanged,
+    this.connectivity,
   });
 
   @override
@@ -48,25 +55,58 @@ class UmMapWidget extends StatefulWidget {
 }
 
 class _UmMapWidgetState extends State<UmMapWidget> {
+  /// Memory-only cache for tiles outside the campus (lost on restart).
+  /// Campus tiles at zoom 16–19 are kept on disk by [CampusTileCache].
   static final CacheStore _cacheStore = MemCacheStore();
 
   // Built once per widget — not in build() — so frequent rebuilds (e.g. an
   // animated route overlay) don't spawn a new Dio client every frame.
-  late final CachedTileProvider _baseTileProvider = CachedTileProvider(
-    maxStale: const Duration(days: 30),
-    store: _cacheStore,
+  late final TileProvider _baseTileProvider = CampusCachedTileProvider(
+    source: CampusTileSource.base,
+    fallback: CachedTileProvider(
+      maxStale: const Duration(days: 30),
+      store: _cacheStore,
+    ),
   );
-  late final CachedTileProvider _overlayTileProvider = CachedTileProvider(
-    maxStale: const Duration(days: 30),
-    store: _cacheStore,
+  late final TileProvider _overlayTileProvider = CampusCachedTileProvider(
+    source: CampusTileSource.overlay,
+    fallback: CachedTileProvider(
+      maxStale: const Duration(days: 30),
+      store: _cacheStore,
+    ),
   );
 
   double _zoom = 17.5;
+
+  late final ConnectivityService _connectivity =
+      widget.connectivity ?? ConnectivityService.instance;
 
   @override
   void initState() {
     super.initState();
     _zoom = widget.initialZoom;
+    _connectivity.addListener(_onConnectivityChange);
+  }
+
+  @override
+  void dispose() {
+    _connectivity.removeListener(_onConnectivityChange);
+    super.dispose();
+  }
+
+  void _onConnectivityChange() {
+    if (!mounted) return;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) => _keepToSavedTiles());
+  }
+
+  /// Offline, a map zoomed out below the saved tiles moves back in to them.
+  void _keepToSavedTiles() {
+    if (!mounted || _connectivity.isOnline) return;
+    final camera = widget.controller.camera;
+    if (camera.zoom < MapTilerConfig.offlineMinZoom) {
+      widget.controller.move(camera.center, MapTilerConfig.offlineMinZoom);
+    }
   }
 
   @override
@@ -90,7 +130,7 @@ class _UmMapWidgetState extends State<UmMapWidget> {
       options: MapOptions(
         initialCenter: widget.initialCenter ?? MapTilerConfig.campusCenter,
         initialZoom: widget.initialZoom,
-        minZoom: MapTilerConfig.minZoom,
+        minZoom: MapTilerConfig.minZoomFor(online: _connectivity.isOnline),
         maxZoom: MapTilerConfig.maxZoom,
         backgroundColor: AppColors.backgroundGray,
         cameraConstraint: CameraConstraint.contain(
@@ -99,7 +139,10 @@ class _UmMapWidgetState extends State<UmMapWidget> {
         interactionOptions: const InteractionOptions(
           flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
         ),
-        onMapReady: widget.onMapReady,
+        onMapReady: () {
+          _keepToSavedTiles();
+          widget.onMapReady?.call();
+        },
         onPositionChanged: (camera, _) {
           widget.onCameraChanged?.call(camera);
           // Only rebuild when zoom crosses the label show/hide threshold —

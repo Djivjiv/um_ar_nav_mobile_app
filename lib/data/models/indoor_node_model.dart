@@ -23,7 +23,20 @@ class IndoorNodeModel {
   final String? operatingHours;
   final String? contact;
   final int? linkedRoomId;
+
+  /// Which table [linkedRoomId] points at: `'rooms'` or `'facilities'`.
   final String? linkedTable;
+
+  /// Floor number this node is on (`indoor_nodes.floor`).
+  final int? floor;
+
+  /// Shared id for the same staircase / elevator across floors
+  /// (e.g. `BE_STAIRS_A`). Only set on stairs / elevator nodes.
+  final String? stairGroup;
+
+  /// `indoor_nodes.is_active`. Missing, null or unreadable counts as active;
+  /// inactive nodes are left out of indoor routing and search.
+  final bool isActive;
 
   const IndoorNodeModel({
     required this.id,
@@ -46,6 +59,9 @@ class IndoorNodeModel {
     this.contact,
     this.linkedRoomId,
     this.linkedTable,
+    this.floor,
+    this.stairGroup,
+    this.isActive = true,
   });
 
   Offset get position => Offset(x, y);
@@ -83,6 +99,9 @@ class IndoorNodeModel {
       contact: J.str(m['contact']),
       linkedRoomId: J.intN(m['linked_room_id']),
       linkedTable: J.str(m['linked_table']),
+      floor: J.intN(m['floor']),
+      stairGroup: J.str(m['stair_group']),
+      isActive: J.isActiveRow(m),
     );
   }
 }

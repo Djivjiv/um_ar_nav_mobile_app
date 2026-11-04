@@ -54,16 +54,17 @@ class _FloorPlanScreenState extends State<FloorPlanScreen> {
         }
       }
       initial ??= floors.isNotEmpty ? floors.first : null;
+      if (!mounted) return;
       setState(() {
         _floors = floors;
         _current = initial;
         _loading = false;
       });
       if (initial != null) {
-        // ignore: use_build_context_synchronously
         context.read<IndoorNavCubit>().loadFloor(initial.id.toString());
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = 'Could not load floor plans.';
         _loading = false;

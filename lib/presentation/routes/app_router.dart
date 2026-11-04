@@ -10,10 +10,10 @@ import '../../data/models/outdoor_node_model.dart';
 import '../bloc/auth/auth_cubit.dart';
 import '../screens/about/about_screen.dart';
 import '../screens/ar/ar_screen.dart';
+import '../screens/auth/account_status_screen.dart';
 import '../screens/auth/login_screen.dart';
-import '../screens/auth/register_screen.dart';
 import '../screens/auth/role_selection_screen.dart';
-import '../screens/auth/verify_email_screen.dart';
+import '../screens/auth/visitor_ended_screen.dart';
 import '../screens/auth/visitor_screen.dart';
 import '../screens/floor_plan/floor_plan_screen.dart';
 import '../screens/geofence/location_permission_screen.dart';
@@ -21,13 +21,13 @@ import '../screens/geofence/location_service_screen.dart';
 import '../screens/geofence/outside_campus_screen.dart';
 import '../screens/main/main_screen.dart';
 import '../screens/map/map_screen.dart';
-import '../screens/navigation/turn_by_turn_screen.dart';
 import '../screens/onboarding/onboarding_screen.dart';
 import '../screens/places/building_detail_screen.dart';
 import '../screens/places/places_screen.dart';
 import '../screens/profile/profile_screen.dart';
 import '../screens/splash/splash_screen.dart';
 import '../screens/survey/survey_screen.dart';
+import '../bloc/navigation/navigation_session_logger.dart';
 
 /// Arguments passed to the turn-by-turn navigation screen.
 class TurnByTurnArgs {
@@ -48,12 +48,33 @@ class AppRouter {
   static final _rootKey = GlobalKey<NavigatorState>();
   static final _shellKey = GlobalKey<NavigatorState>();
 
-  static GoRouter build(BuildContext context) {
+  /// A blocked account sees only `/account-status`, whatever it asks for.
+  static String? blockedRedirect(AuthState state, String loc) {
+    if (state is! AuthAccountBlocked) return null;
+    return loc == '/account-status' ? null : '/account-status';
+  }
+
+  /// A visitor whose session is over sees only `/visitor-ended`, from the
+  /// moment its time is up.
+  static String? visitorEndedRedirect(AuthState state, String loc) {
+    final ended = state is AuthVisitorEnded ||
+        (state is AuthVisitor && !state.session.isStillValid);
+    if (!ended) return null;
+    return loc == visitorEndedRoute ? null : visitorEndedRoute;
+  }
+
+  /// The floor plan viewer is not for those who [canSeeIndoorMap] says no to.
+  static String? indoorMapRedirect(AuthState state, String loc) =>
+      loc.startsWith('/floor-plan') && !canSeeIndoorMap(state) ? '/map' : null;
+
+  static const String visitorEndedRoute = '/visitor-ended';
+
+  static GoRouter build(BuildContext context, {String initialLocation = '/'}) {
     final authCubit = context.read<AuthCubit>();
 
     return GoRouter(
       navigatorKey: _rootKey,
-      initialLocation: '/',
+      initialLocation: initialLocation,
       refreshListenable: _CubitRefresh(authCubit.stream),
       redirect: (context, state) {
         final authState = authCubit.state;
@@ -63,9 +84,8 @@ class AppRouter {
           '/',
           '/onboarding',
           '/login',
-          '/register',
-          '/verify-email',
           '/visitor',
+          visitorEndedRoute,
         };
 
         final isAuthed = authState is AuthAuthenticated;
@@ -75,6 +95,12 @@ class AppRouter {
 
         // Splash decides where a cold start goes.
         if (loc == '/') return null;
+
+        final ended = visitorEndedRedirect(authState, loc);
+        if (ended != null) return ended;
+
+        final blocked = blockedRedirect(authState, loc);
+        if (blocked != null || authState is AuthAccountBlocked) return blocked;
 
         // Geofence gates are always reachable once past splash.
         if (loc == '/outside-campus' ||
@@ -97,6 +123,9 @@ class AppRouter {
           return publicRoutes.contains(loc) ? null : '/login';
         }
 
+        final noIndoorMap = indoorMapRedirect(authState, loc);
+        if (noIndoorMap != null) return noIndoorMap;
+
         // '/main' is an alias for the map tab.
         if (loc == '/main') return '/map';
 
@@ -105,9 +134,9 @@ class AppRouter {
         // created session's countdown before the user taps "Continue".
         if (isAuthed &&
             (loc == '/login' ||
-                loc == '/register' ||
                 loc == '/onboarding' ||
-                loc == '/select-role')) {
+                loc == '/select-role' ||
+                loc == '/account-status')) {
           return '/map';
         }
         return null;
@@ -118,13 +147,15 @@ class AppRouter {
             path: '/onboarding',
             builder: (c, s) => const OnboardingScreen()),
         GoRoute(path: '/login', builder: (c, s) => const LoginScreen()),
-        GoRoute(path: '/register', builder: (c, s) => const RegisterScreen()),
-        GoRoute(
-          path: '/verify-email',
-          builder: (c, s) =>
-              VerifyEmailScreen(email: s.uri.queryParameters['email'] ?? ''),
-        ),
         GoRoute(path: '/visitor', builder: (c, s) => const VisitorScreen()),
+        GoRoute(
+          path: visitorEndedRoute,
+          builder: (c, s) => const VisitorEndedScreen(),
+        ),
+        GoRoute(
+          path: '/account-status',
+          builder: (c, s) => const AccountStatusScreen(),
+        ),
         GoRoute(
           path: '/select-role',
           builder: (c, s) => const RoleSelectionScreen(),
@@ -181,15 +212,11 @@ class AppRouter {
           ),
         ),
         GoRoute(
-          path: '/navigate',
-          parentNavigatorKey: _rootKey,
-          builder: (c, s) =>
-              TurnByTurnScreen(args: s.extra as TurnByTurnArgs?),
-        ),
-        GoRoute(
           path: '/survey',
           parentNavigatorKey: _rootKey,
-          builder: (c, s) => const SurveyScreen(),
+          builder: (c, s) => SurveyScreen(
+              navigationSessionId:
+                  NavigationSessionLogger.tripIdFromRouteExtra(s.extra)),
         ),
         GoRoute(
           path: '/profile',

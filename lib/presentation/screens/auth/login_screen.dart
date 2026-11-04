@@ -13,9 +13,8 @@ class LoginScreen extends StatefulWidget {
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen> {
+class _LoginScreenState extends State<LoginScreen> with CampusGate {
   bool _isLoading = false;
-  bool _gating = false;
   String? _errorMessage;
 
   void _signInWithGoogle() {
@@ -24,15 +23,6 @@ class _LoginScreenState extends State<LoginScreen> {
       _errorMessage = null;
     });
     context.read<AuthCubit>().signInWithGoogle();
-  }
-
-  /// Signed in — but still verify the user is on campus before the map.
-  Future<void> _gateToMap() async {
-    if (_gating) return;
-    _gating = true;
-    final inside = await GeofenceService.gate(context);
-    if (inside && mounted) context.go('/map');
-    _gating = false;
   }
 
   @override
@@ -51,7 +41,7 @@ class _LoginScreenState extends State<LoginScreen> {
           } else if (state is AuthNeedsRoleSelection) {
             context.go('/select-role');
           } else if (state is AuthAuthenticated) {
-            _gateToMap();
+            gateToMap();
           } else if (state is AuthUnauthenticated) {
             // Cancelled sign-in — just clear the spinner, no message.
             setState(() => _errorMessage = null);

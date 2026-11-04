@@ -9,11 +9,20 @@ class NavEndpoint {
   final int? buildingId;
   final LatLng? point;
 
+  /// The place picked in the route planner, as `outdoor_nodes` only know the
+  /// building: `'building'` / `'room'` / `'facility'`, its id and its building.
+  final String? placeType;
+  final String? placeId;
+  final int? placeBuildingId;
+
   const NavEndpoint({
     required this.label,
     this.nodeId,
     this.buildingId,
     this.point,
+    this.placeType,
+    this.placeId,
+    this.placeBuildingId,
   });
 
   bool get isBuilding => buildingId != null;
@@ -24,6 +33,9 @@ class OutdoorNavState {
   final NavEndpoint? from;
   final NavEndpoint? to;
   final List<LatLng> path;
+
+  /// Graph node ids of [path], in order (one per path point).
+  final List<String> pathNodeIds;
   final List<NavigationInstruction> instructions;
   final double distanceMeters;
   final int walkMinutes;
@@ -38,6 +50,7 @@ class OutdoorNavState {
     this.from,
     this.to,
     this.path = const [],
+    this.pathNodeIds = const [],
     this.instructions = const [],
     this.distanceMeters = 0,
     this.walkMinutes = 0,
@@ -56,6 +69,7 @@ class OutdoorNavState {
     NavEndpoint? from,
     NavEndpoint? to,
     List<LatLng>? path,
+    List<String>? pathNodeIds,
     List<NavigationInstruction>? instructions,
     double? distanceMeters,
     int? walkMinutes,
@@ -69,6 +83,8 @@ class OutdoorNavState {
       from: from ?? this.from,
       to: to ?? this.to,
       path: clearRoute ? const [] : (path ?? this.path),
+      pathNodeIds:
+          clearRoute ? const [] : (pathNodeIds ?? this.pathNodeIds),
       instructions:
           clearRoute ? const [] : (instructions ?? this.instructions),
       distanceMeters: clearRoute ? 0 : (distanceMeters ?? this.distanceMeters),

@@ -1,5 +1,10 @@
 import '../../core/utils/json_utils.dart';
 
+/// Whether an account may use the app. The admin app rejects an account by
+/// clearing both `is_verified` and `is_active`, and deactivates one by
+/// clearing `is_active` alone.
+enum AccountAccess { allowed, needsRole, pending, rejected, inactive }
+
 class UserProfileModel {
   final String id;
   final String? email;
@@ -29,10 +34,14 @@ class UserProfileModel {
 
   bool get isAdmin => roleLabel.toLowerCase() == 'admin';
 
-  /// Roles allowed to use the app once selected.
-  bool get isAllowed {
-    final r = roleLabel.toLowerCase();
-    return r == 'student' || r == 'faculty' || r == 'employee';
+  AccountAccess get access {
+    if (!isActive) {
+      return isVerified ? AccountAccess.inactive : AccountAccess.rejected;
+    }
+    if (!hasRole) return AccountAccess.needsRole;
+    return isVerified || isAdmin
+        ? AccountAccess.allowed
+        : AccountAccess.pending;
   }
 
   String get displayName =>
@@ -59,35 +68,4 @@ class UserProfileModel {
         'is_verified': isVerified,
         'is_active': isActive,
       };
-}
-
-class VisitorSessionModel {
-  final String id;
-  final String deviceId;
-  final DateTime startedAt;
-  final DateTime expiresAt;
-  final bool isExpired;
-
-  const VisitorSessionModel({
-    required this.id,
-    required this.deviceId,
-    required this.startedAt,
-    required this.expiresAt,
-    this.isExpired = false,
-  });
-
-  Duration get remaining => expiresAt.difference(DateTime.now());
-
-  bool get isStillValid => !isExpired && remaining > Duration.zero;
-
-  factory VisitorSessionModel.fromMap(Map<String, dynamic> m) {
-    return VisitorSessionModel(
-      id: J.strOr(m['id']),
-      deviceId: J.strOr(m['device_id']),
-      startedAt: J.date(m['started_at']) ?? DateTime.now(),
-      expiresAt: J.date(m['expires_at']) ??
-          DateTime.now().add(const Duration(hours: 2)),
-      isExpired: J.boolOr(m['is_expired']),
-    );
-  }
 }

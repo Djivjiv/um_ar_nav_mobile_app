@@ -71,8 +71,6 @@ class GeofenceService {
       );
 
       debugPrint('📍 GPS Position:');
-      debugPrint('   Lat: ${position.latitude}');
-      debugPrint('   Lng: ${position.longitude}');
       debugPrint('   Accuracy: ${position.accuracy}m');
 
       debugPrint('   Campus bounds:');
@@ -114,7 +112,7 @@ class GeofenceService {
           timeLimit: timeLimit,
         ),
       );
-      debugPrint('📍 GPS: ${pos.latitude}, ${pos.longitude} '
+      debugPrint('📍 GPS fix '
           '(±${pos.accuracy.toStringAsFixed(0)}m)');
       final inside = isInsideCampus(pos.latitude, pos.longitude);
       debugPrint(inside ? '✅ Inside campus' : '❌ Outside campus');
@@ -190,5 +188,19 @@ class GeofenceService {
   /// Opens this app's settings screen (for permanently denied permission).
   static Future<void> openAppSettings() async {
     await Geolocator.openAppSettings();
+  }
+}
+
+/// For the screens that lead into the map.
+mixin CampusGate<T extends StatefulWidget> on State<T> {
+  bool _gating = false;
+
+  /// Signed in, but still verifies the user is on campus before the map.
+  Future<void> gateToMap() async {
+    if (_gating) return;
+    _gating = true;
+    final inside = await GeofenceService.gate(context);
+    if (inside && mounted) context.go('/map');
+    _gating = false;
   }
 }

@@ -3,16 +3,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../core/config/app_config.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/geofence_service.dart';
-import '../../../core/utils/session_service.dart';
+import '../../../core/utils/indoor_route_helpers.dart';
+import '../../../data/models/indoor_node_model.dart';
 import '../../bloc/auth/auth_cubit.dart';
 import '../../bloc/search/search_cubit.dart';
 import '../../widgets/search_bar_widget.dart';
-import '../temp/geo_reference_screen.dart'; // ⚠️ temporary georeferencing tool
 
 class _Tab {
   final String route;
@@ -26,7 +25,6 @@ const _tabs = [
   _Tab('/ar', Icons.view_in_ar, 'AR'),
   _Tab('/places', Icons.business, 'Places'),
   _Tab('/about', Icons.info_outline, 'About'),
-  _Tab('/geo', Icons.map_outlined, 'Geo'), // ⚠️ temporary georeferencing tool
 ];
 
 class MainScreen extends StatefulWidget {
@@ -52,11 +50,11 @@ class _MainScreenState extends State<MainScreen> {
     super.initState();
     _visitorTimer = Timer.periodic(
       const Duration(minutes: 1),
-      (timer) => _checkVisitorSessionWarning(timer),
+      (_) => _checkVisitorSessionWarning(),
     );
     // Run one check shortly after first frame.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkVisitorSessionWarning(_visitorTimer);
+      _checkVisitorSessionWarning();
       _verifyCampus();
     });
   }
@@ -82,43 +80,15 @@ class _MainScreenState extends State<MainScreen> {
     super.dispose();
   }
 
-  Future<void> _checkVisitorSessionWarning(Timer? timer) async {
+  /// The last-15-minutes banner. The end of the session itself is handled by
+  /// `VisitorExpiryWatcher` and the router.
+  void _checkVisitorSessionWarning() {
     if (!mounted) return;
-    if (context.read<AuthCubit>().state is! AuthVisitor) return;
+    final state = context.read<AuthCubit>().state;
+    if (state is! AuthVisitor) return;
 
-    final prefs = await SharedPreferences.getInstance();
-    final sessionId = prefs.getString('visitor_session_id');
-    if (sessionId == null) return;
-
-    final minutes =
-        await SessionService.getVisitorRemainingMinutes(sessionId);
-    if (!mounted) return;
-
-    if (minutes <= 0) {
-      timer?.cancel();
-      await prefs.remove('visitor_session_id');
-      if (!mounted) return;
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => AlertDialog(
-          title: const Text('Session Expired'),
-          content: const Text(
-              'Your visitor session has expired. Please sign in with your '
-              'school email for continued access.'),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                context.go('/login');
-              },
-              child: const Text('OK',
-                  style: TextStyle(color: AppColors.primaryMaroon)),
-            ),
-          ],
-        ),
-      );
-    } else if (minutes <= 15) {
+    final minutes = state.session.remaining.inMinutes;
+    if (minutes <= 15) {
       setState(() {
         _showVisitorWarning = true;
         _visitorRemainingMinutes = minutes;
@@ -144,19 +114,7 @@ class _MainScreenState extends State<MainScreen> {
     return Scaffold(
       bottomNavigationBar: _BottomNavBar(
         currentIndex: index,
-        onTap: (i) {
-          // ⚠️ The temporary "Geo" tool has no go_router route — it is a
-          // pushed screen, not one of the shell tabs.
-          if (_tabs[i].route == '/geo') {
-            Navigator.of(context, rootNavigator: true).push(
-              MaterialPageRoute<void>(
-                builder: (_) => const GeoReferenceScreen(),
-              ),
-            );
-          } else {
-            context.go(_tabs[i].route);
-          }
-        },
+        onTap: (i) => context.go(_tabs[i].route),
       ),
       body: Stack(
         children: [
@@ -232,7 +190,6 @@ class _BottomNavBar extends StatelessWidget {
     [Icons.view_in_ar_outlined, Icons.view_in_ar],
     [Icons.business_outlined, Icons.business],
     [Icons.info_outline, Icons.info],
-    [Icons.map_outlined, Icons.map], // ⚠️ temporary georeferencing tool
   ];
 
   @override
@@ -329,6 +286,29 @@ class AppSearchDelegate extends SearchDelegate<void> {
     close(context, null);
   }
 
+  /// Place map for an indoor-node result: the node's real floor, and its
+  /// type / id from `linked_table` (room ids and facility ids can collide).
+  /// `indoor_node_id` lets indoor routing target this exact node.
+  Map<String, dynamic> _indoorNodePlace(IndoorNodeModel n) {
+    final dest = indoorNodeDestination(n);
+    final isRoom = dest.type == 'room';
+    return {
+      'type': dest.type,
+      'id': dest.id,
+      'indoor_node_id': n.id,
+      'name': n.displayLabel,
+      'subtitle': n.floor != null
+          ? 'Indoor location — Floor ${n.floor}'
+          : 'Indoor location',
+      'building_id': n.buildingId,
+      'floor': n.floor,
+      'icon': isRoom
+          ? Icons.door_front_door_outlined
+          : Icons.meeting_room_outlined,
+      'color': isRoom ? AppColors.infoBlue : AppColors.accentGold,
+    };
+  }
+
   @override
   Widget buildResults(BuildContext context) => _body(context);
 
@@ -354,6 +334,24 @@ class AppSearchDelegate extends SearchDelegate<void> {
           if (state.status == SearchStatus.loading) {
             return const Center(child: CircularProgressIndicator());
           }
+          if (state.status == SearchStatus.error) {
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.wifi_off,
+                      size: 56, color: AppColors.textSecondary),
+                  const SizedBox(height: 12),
+                  const Text(SearchCubit.failedMessage,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: AppColors.textSecondary)),
+                  const SizedBox(height: 12),
+                  OutlinedButton(
+                      onPressed: cubit.retry, child: const Text('Retry')),
+                ],
+              ),
+            );
+          }
           if (state.isEmpty) {
             return const Center(
               child: Text('No matches found',
@@ -362,6 +360,14 @@ class AppSearchDelegate extends SearchDelegate<void> {
           }
           return ListView(
             children: [
+              if (state.notice != null)
+                ListTile(
+                  leading: const Icon(Icons.warning_amber_rounded,
+                      color: AppColors.accentGold),
+                  title: Text(state.notice!,
+                      style: const TextStyle(
+                          fontSize: 13, color: AppColors.textSecondary)),
+                ),
               for (final b in state.buildings)
                 ListTile(
                   leading: const Icon(Icons.location_city,
@@ -403,17 +409,9 @@ class AppSearchDelegate extends SearchDelegate<void> {
                   leading: const Icon(Icons.place_outlined,
                       color: AppColors.infoBlue),
                   title: Text(n.displayLabel),
-                  subtitle: const Text('Indoor location'),
-                  onTap: () => _pick(context, {
-                    'type': 'facility',
-                    'id': n.id,
-                    'name': n.displayLabel,
-                    'subtitle': 'Indoor location — Floor 1',
-                    'building_id': n.buildingId,
-                    'floor': null,
-                    'icon': Icons.meeting_room_outlined,
-                    'color': AppColors.accentGold,
-                  }),
+                  subtitle: Text('Indoor location'
+                      '${n.floor != null ? ' · Floor ${n.floor}' : ''}'),
+                  onTap: () => _pick(context, _indoorNodePlace(n)),
                 ),
             ],
           );

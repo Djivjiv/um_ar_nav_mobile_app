@@ -1,25 +1,51 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
+import 'package:latlong2/latlong.dart' show Distance, LatLng, LengthUnit;
 
+import '../../../core/config/ar_nav_config.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/indoor_entrance.dart';
+import '../../../core/utils/indoor_route_helpers.dart';
 import '../../../core/utils/navigation_phase_manager.dart';
 import '../../../data/models/floor_plan_model.dart';
 import '../../../data/models/indoor_edge_model.dart';
 import '../../../data/models/indoor_node_model.dart';
 import '../../../data/repositories/floor_plan_repository.dart';
 import '../../../data/repositories/indoor_navigation_repository.dart';
+import '../../../data/repositories/repository_exception.dart';
+import '../../../domain/services/ar_route_geometry.dart';
+import '../../../domain/services/dijkstra_service.dart';
+import '../../../domain/services/indoor_text_steps.dart';
+import '../../../domain/services/off_route_tracker.dart';
+import '../../bloc/auth/auth_cubit.dart';
+import '../../bloc/navigation/navigation_session_logger.dart';
 import '../../bloc/navigation/outdoor_nav_cubit.dart';
 import '../../routes/app_router.dart';
+import '../../widgets/arrival_feedback.dart';
+import '../../widgets/exit_navigation_dialog.dart';
+import '../../widgets/route_start_picker.dart'
+    show LocateUser, currentUserLocation;
+import '../../widgets/visitor_indoor_steps.dart';
 import 'turn_by_turn_screen.dart';
 
 class MultiPhaseNavScreen extends StatefulWidget {
   final NavigationRoute navigationRoute;
-  const MultiPhaseNavScreen({super.key, required this.navigationRoute});
+
+  /// The user's position, for the nearest-entrance start.
+  final LocateUser locate;
+
+  const MultiPhaseNavScreen({
+    super.key,
+    required this.navigationRoute,
+    this.locate = currentUserLocation,
+  });
 
   @override
   State<MultiPhaseNavScreen> createState() => _MultiPhaseNavScreenState();
@@ -32,13 +58,38 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
   bool _indoorLoading = false;
   String? _indoorError;
 
-  /// The floor the user starts on (origin room's floor, or the ground floor
-  /// when coming in from outside) and the destination floor.
+  /// The floor the user starts on (origin room's floor, or the start
+  /// entrance's own floor) and the destination floor.
   FloorPlanModel? _startPlan;
   FloorPlanModel? _destPlan;
 
   /// 0 = start floor (walk to stairs/elevator), 1 = destination floor.
   int _indoorFloorStep = 0;
+
+  /// Two-floor trips: the one stair/elevator group used for BOTH legs.
+  StairGroupChoice? _transportChoice;
+
+  /// What [_resolveStart] found. Null until it has run.
+  IndoorStartDecision? _startDecision;
+  List<BuildingEntrance> _entrances = const [];
+  List<FloorPlanModel> _floors = const [];
+
+  /// The entrance the trip starts from, or null when that isn't known or the
+  /// trip starts at its origin room.
+  BuildingEntrance? _startEntrance;
+
+  /// The origin room is on its floor plan, so no entrance is needed.
+  bool _startsAtOriginRoom = false;
+
+  /// Working out the start failed; says nothing about the entrances.
+  String? _startError;
+
+  static const _noTransportMessage =
+      'No connected stairs or elevator found between these floors.';
+  static const _roomNotMappedMessage =
+      'This room is not mapped on the floor plan yet.';
+  static const _startNotFoundMessage =
+      'The starting point is not on this floor plan.';
 
   /// Computed per step: pixel-space path + start/end for the current floor.
   List<Offset> _pathPixels = const [];
@@ -51,35 +102,186 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
   bool _navNextPressed = false;
   bool _navPrevPressed = false;
 
-  int get _originFloor => _route.originFloor ?? 1;
+  /// The named place where each of [_instructions] begins, if any.
+  List<String?> _stepLandmarks = const [];
+
+  /// How many written steps the start floor took, so the destination floor
+  /// carries on counting.
+  int _startFloorTextSteps = 0;
+
+  /// Written steps instead of the 2D indoor map (see [canSeeIndoorMap]).
+  bool get _textDirectionsOnly {
+    final auth = context.read<AuthCubit?>();
+    return auth != null && !canSeeIndoorMap(auth.state);
+  }
+
+  bool get _startKnown => _startEntrance != null || _startsAtOriginRoom;
+
+  int get _originFloor =>
+      _startEntrance?.plan?.floorNumber ?? _route.originFloor ?? 1;
   int get _destFloorNo => _route.destFloor ?? 1;
 
   /// Start and destination are on the same floor — one floor plan, no
-  /// stairs / elevator step.
-  bool get _sameFloor => _originFloor == _destFloorNo;
+  /// stairs / elevator step. Plans decide once loaded, as a building's ground
+  /// floor can be numbered 0 or 1.
+  bool get _sameFloor {
+    final start = _startPlan;
+    final dest = _destPlan;
+    if (start != null && dest != null) return start.id == dest.id;
+    return _originFloor == _destFloorNo;
+  }
 
   bool get _needsTwoFloors => !_sameFloor && _destPlan != null;
 
   @override
   void initState() {
     super.initState();
-    if (_route.currentPhase == NavigationPhase.indoorNavigation) {
-      WidgetsBinding.instance
-          .addPostFrameCallback((_) => _loadIndoor());
+    _analytics = _buildAnalytics()..start();
+    _startOffRouteTracking();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _enterPhase();
+    });
+  }
+
+  @override
+  void dispose() {
+    _gpsSub?.cancel();
+    // Left without arriving → an "abandoned" end row (no-op if completed).
+    _analytics.abandon();
+    super.dispose();
+  }
+
+  /// `navigation_sessions` logging: a start row, then one end row.
+  late final NavigationSessionLogger _analytics;
+
+  bool get _hasOutdoorLeg =>
+      _route.phases.contains(NavigationPhase.outdoorNavigation) &&
+      _route.outdoorPath.length >= 2;
+
+  /// Outdoor turn-by-turn steps, and indoor steps per floor leg — together
+  /// the trip's total steps (error-rate denominator).
+  int _outdoorSteps = 0;
+  final Map<int, int> _indoorStepCounts = {};
+
+  NavigationSessionLogger _buildAnalytics() {
+    // Outdoor legs log the graph's own node ids; indoor-only trips fall back
+    // to the endpoints' ids.
+    var fromNode = NavigationSessionLogger.endpointId(_route.from);
+    var toNode = NavigationSessionLogger.endpointId(_route.to);
+    try {
+      final s = context.read<OutdoorNavCubit>().state;
+      if (_route.phases.contains(NavigationPhase.outdoorNavigation)) {
+        _outdoorSteps = s.instructions.isNotEmpty
+            ? s.instructions.length
+            : math.max(0, _route.outdoorPath.length - 1);
+        if (s.pathNodeIds.isNotEmpty) {
+          fromNode = s.pathNodeIds.first;
+          toNode = s.pathNodeIds.last;
+        }
+      }
+    } catch (_) {}
+    return NavigationSessionLogger.of(
+      context,
+      mode: TripMode.twoD,
+      totalSteps: _outdoorSteps,
+      fromNode: fromNode,
+      toNode: toNode,
+      fromName: _route.fromName ?? _route.from['name']?.toString() ?? 'Start',
+      toName: _route.toName ?? _route.to['name']?.toString() ?? 'Destination',
+      distanceMeters: _route.distanceMeters,
+    );
+  }
+
+  // ─────────────── off-route counting (outdoor leg, GPS) ───────────────
+
+  StreamSubscription<Position>? _gpsSub;
+  final OffRouteTracker _offRouteTracker = OffRouteTracker();
+  DenseRoute? _outdoorRoute;
+  SnapResult? _snap;
+  LatLng? _lastFix;
+  DateTime? _lastFixAt;
+
+  /// The 2D map has no live guidance, but GPS still tells whether the user
+  /// left the outdoor route — counted the same way as in AR. Without GPS
+  /// permission nothing is counted and the trip is stored as not tracked.
+  void _startOffRouteTracking() {
+    if (!_hasOutdoorLeg) return;
+    _outdoorRoute = densifyPolyline(_route.outdoorPath);
+    try {
+      _gpsSub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: ArNavConfig.gpsDistanceFilterMeters,
+        ),
+      ).listen(_onFix,
+          onError: (Object e) => debugPrint('2D off-route GPS: $e'));
+    } catch (e) {
+      debugPrint('2D off-route GPS unavailable: $e');
     }
   }
 
+  void _onFix(Position p) {
+    final me = LatLng(p.latitude, p.longitude);
+    _lastFix = me;
+    _lastFixAt = DateTime.now();
+    final route = _outdoorRoute;
+    if (route == null ||
+        _analytics.ended ||
+        _route.currentPhase != NavigationPhase.outdoorNavigation) {
+      return;
+    }
+    final snap =
+        route.snap(me, previousDistanceAlong: _snap?.distanceAlong);
+    _snap = snap;
+    if (_offRouteTracker.update(snap.distanceFromRoute,
+        accuracyMeters: p.accuracy)) {
+      _analytics.recordOffRoute();
+    } else if (_offRouteTracker.tracked) {
+      _analytics.markOffRouteTracked();
+    }
+  }
+
+  /// True only when a recent GPS fix is within the arrival radius of an
+  /// outdoor destination. Indoor destinations can't be confirmed by GPS.
+  bool _gpsConfirmsArrival() {
+    if (_route.phases.contains(NavigationPhase.indoorNavigation) ||
+        !_hasOutdoorLeg) {
+      return false;
+    }
+    final fix = _lastFix;
+    final at = _lastFixAt;
+    if (fix == null ||
+        at == null ||
+        DateTime.now().difference(at) > const Duration(seconds: 30)) {
+      return false;
+    }
+    final d = const Distance()
+        .as(LengthUnit.Meter, fix, _route.outdoorPath.last);
+    return d <= ArNavConfig.defaultArrivalRadiusMeters;
+  }
+
+  /// The user reached the last step. In 2D, tapping through to "Arrived"
+  /// is their own confirmation — stored as manual unless GPS confirms it.
+  void _completeTrip() =>
+      _analytics.complete(manual: !_gpsConfirmsArrival());
+
+  void _logIfArrived() {
+    if (_route.currentPhase == NavigationPhase.arrived) _completeTrip();
+  }
+
   void _advance() {
-    setState(() {
-      _route.advancePhase();
-      // Same-floor trips don't need a stairs / elevator choice.
-      if (_route.currentPhase == NavigationPhase.elevatorOrStairs &&
-          _sameFloor) {
-        _route.advancePhase();
-      }
-    });
-    if (_route.currentPhase == NavigationPhase.indoorNavigation) {
-      _loadIndoor();
+    setState(_route.advancePhase);
+    _logIfArrived();
+    _enterPhase();
+  }
+
+  /// The stairs / elevator choice depends on the start floor, so the start is
+  /// worked out before that screen, not after it.
+  void _enterPhase() {
+    final phase = _route.currentPhase;
+    if (phase == NavigationPhase.elevatorOrStairs ||
+        phase == NavigationPhase.indoorNavigation) {
+      _enterIndoorPhase();
     }
   }
 
@@ -87,50 +289,217 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     setState(() {
       _route.currentPhaseIndex = _route.phases.length - 1;
     });
+    _logIfArrived();
+  }
+
+  // ─────────────────────── indoor start ───────────────────────
+
+  /// The trip begins inside the destination building, at a room / facility.
+  /// With an outdoor leg the origin room is in ANOTHER building, so it must
+  /// never be looked up on this building's floors.
+  bool get _tripStartsInRoom {
+    final fromType = (_route.from['type'] ?? 'building').toString();
+    return (fromType == 'room' || fromType == 'facility') &&
+        !_route.phases.contains(NavigationPhase.outdoorNavigation);
+  }
+
+  /// Finds the start if it isn't known yet, then shows the stairs / elevator
+  /// choice or the indoor route.
+  Future<void> _enterIndoorPhase({bool forceRefresh = false}) async {
+    if (!_startKnown) {
+      await _resolveStart(forceRefresh: forceRefresh);
+      if (!mounted || !_startKnown) return;
+    }
+    // Same floor as the destination → no stairs / elevator step. A different
+    // floor needs that choice if none was made yet.
+    setState(() {
+      final transportStep =
+          _route.phases.indexOf(NavigationPhase.elevatorOrStairs);
+      if (transportStep != -1 &&
+          !_sameFloor &&
+          _route.selectedTransport == null) {
+        _route.currentPhaseIndex = transportStep;
+      } else if (_route.currentPhase == NavigationPhase.elevatorOrStairs) {
+        _route.advancePhase();
+      }
+    });
+    if (_route.currentPhase == NavigationPhase.indoorNavigation) {
+      await _loadIndoor();
+    }
+  }
+
+  /// Finds where the indoor route starts: the origin room, else the entrance
+  /// from [decideIndoorStart]. When that needs the user, [_startDecision] is
+  /// left for [_entranceGateScreen] to show. A load failure is reported as
+  /// such — it says nothing about the building's entrances.
+  Future<void> _resolveStart({bool forceRefresh = false}) async {
+    final bId = int.tryParse(_route.destBuildingId ?? '');
+    if (bId == null) {
+      setState(() => _startError = 'Destination building is unknown.');
+      return;
+    }
+    final floorRepo = context.read<FloorPlanRepository>();
+    final indoorRepo = context.read<IndoorNavigationRepository>();
+    final nav = context.read<OutdoorNavCubit>();
+    if (forceRefresh) indoorRepo.clearCache();
+    setState(() {
+      _startError = null;
+      _startDecision = null;
+    });
+    try {
+      _floors = await floorRepo.getFloorsForBuilding(bId);
+
+      if (_tripStartsInRoom) {
+        final plan = _applyFloorPlans().start;
+        if (plan != null &&
+            _srcRoomNode(await indoorRepo.getNodesForFloor(plan.id.toString())) !=
+                null) {
+          if (mounted) setState(() => _startsAtOriginRoom = true);
+          return;
+        }
+      }
+
+      if (!await nav.ensureGraph()) {
+        throw RepositoryException(nav.state.error ??
+            IndoorNavigationRepository.connectionErrorMessage);
+      }
+      final floors = <FloorNodes>[
+        for (final f in _floors)
+          (plan: f, nodes: await indoorRepo.getNodesForFloor(f.id.toString())),
+      ];
+      final entrances = buildingEntrances(
+        buildingId: bId,
+        outdoorNodes: nav.repo.nodes,
+        floors: floors,
+      );
+      final decision = await decideIndoorStart(
+        entrances: entrances,
+        arrivedOutdoorNodeId: _route.arrivalOutdoorNodeId,
+        locate: widget.locate,
+      );
+      if (!mounted) return;
+      debugPrint('🚪 Indoor start: ${decision.kind.name} '
+          '${decision.entrance?.name ?? ""} '
+          '(${entrances.length} entrance(s))');
+      setState(() {
+        _entrances = entrances;
+        _startDecision = decision;
+        if (decision.canStart) _setStartEntrance(decision.entrance!);
+      });
+    } on RepositoryException catch (e) {
+      if (mounted) setState(() => _startError = e.message);
+    } catch (e) {
+      debugPrint('❌ Indoor start failed: $e');
+      if (mounted) {
+        setState(() =>
+            _startError = IndoorNavigationRepository.connectionErrorMessage);
+      }
+    }
+  }
+
+  void _setStartEntrance(BuildingEntrance entrance) {
+    _startEntrance = entrance;
+    _startsAtOriginRoom = false;
+    _applyFloorPlans();
+  }
+
+  /// Start on the entrance's own floor, even if it is not the lowest one.
+  IndoorFloorPlans _applyFloorPlans() {
+    final plans = pickIndoorFloorPlans(
+      floors: _floors,
+      originFloor: _originFloor,
+      destFloor: _destFloorNo,
+      startPlan: _startEntrance?.plan,
+    );
+    _startPlan = plans.start;
+    _destPlan = plans.dest;
+    return plans;
+  }
+
+  /// The user picked [entrance], from the chooser or "Start from".
+  Future<void> _chooseEntrance(BuildingEntrance entrance) async {
+    setState(() => _setStartEntrance(entrance));
+    await _enterIndoorPhase();
+  }
+
+  Future<void> _showEntranceSheet() async {
+    final picked = await showModalBottomSheet<BuildingEntrance>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheet) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16),
+                child: Text('Choose your entrance',
+                    style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: AppColors.textPrimary)),
+              ),
+              const SizedBox(height: 8),
+              _EntranceList(
+                entrances: _entrances,
+                selected: _startEntrance,
+                onSelected: (e) => Navigator.pop(sheet, e),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (picked == null || !mounted || identical(picked, _startEntrance)) return;
+    await _chooseEntrance(picked);
   }
 
   // ─────────────────────── indoor loading ───────────────────────
 
-  Future<void> _loadIndoor() async {
+  /// [forceRefresh] (Retry) drops the cached indoor nodes / edges first.
+  Future<void> _loadIndoor({bool forceRefresh = false}) async {
     final bId = int.tryParse(_route.destBuildingId ?? '');
     if (bId == null) {
       setState(() => _indoorError = 'Destination building is unknown.');
       return;
     }
+    if (forceRefresh) context.read<IndoorNavigationRepository>().clearCache();
     setState(() {
       _indoorLoading = true;
       _indoorError = null;
       _indoorFloorStep = 0;
+      _indoorStepCounts.clear();
     });
     try {
-      final all =
+      _floors =
           await context.read<FloorPlanRepository>().getFloorsForBuilding(bId);
       if (!mounted) return;
-      all.sort((a, b) => a.floorNumber.compareTo(b.floorNumber));
+      // Start on the origin room's floor (or the start entrance's own floor);
+      // end on the destination floor — or show an error when that floor has
+      // no plan, never a different floor.
+      final plans = _applyFloorPlans();
 
-      FloorPlanModel? planForFloor(int floor) {
-        for (final f in all) {
-          if (f.floorNumber == floor) return f;
-        }
-        return null;
-      }
-
-      final lowest = all.isEmpty
-          ? null
-          : all.reduce((a, b) => a.floorNumber <= b.floorNumber ? a : b);
-
-      // Start on the origin room's floor (or the ground floor when the user
-      // is coming in from outside); end on the destination floor.
-      _startPlan = planForFloor(_originFloor) ?? lowest;
-      _destPlan = planForFloor(_destFloorNo) ??
-          (_sameFloor ? _startPlan : (all.isNotEmpty ? all.last : _startPlan));
-
-      if (_startPlan == null) {
+      if (plans.error != null) {
         setState(() {
           _indoorLoading = false;
-          _indoorError = 'No floor plan is available for this building.';
+          _indoorError = plans.error;
         });
         return;
+      }
+
+      _transportChoice = null;
+      if (_needsTwoFloors) {
+        final error = await _chooseTransport();
+        if (!mounted) return;
+        if (error != null) {
+          setState(() {
+            _indoorLoading = false;
+            _indoorError = error;
+          });
+          return;
+        }
       }
 
       await _computeStepPath();
@@ -153,6 +522,7 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
 
     // Reset step state for this floor step.
     _instructions = const [];
+    _stepLandmarks = const [];
     _currentStep = 0;
 
     debugPrint('🗺 Calculating indoor path — floor plan ${plan.id} '
@@ -164,10 +534,14 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       nodes = await repo.getNodesForFloor(plan.id.toString());
       edges = await repo.getEdgesForFloor(plan.id.toString());
     } catch (e) {
+      // A load failure (e.g. no connection) — not "nodes not connected".
       debugPrint('❌ Failed to load indoor nodes/edges: $e');
       _pathPixels = const [];
       _startPixel = null;
       _endPixel = null;
+      _indoorError = e is RepositoryException
+          ? e.message
+          : IndoorNavigationRepository.connectionErrorMessage;
       return;
     }
 
@@ -185,39 +559,50 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       return;
     }
 
-    final transportLabel =
-        _route.selectedTransport == 'elevator' ? 'elevator' : 'stairs';
-
     final nodeById = {for (final n in nodes) n.id: n};
 
-    // When the trip starts inside this building (room → room), begin at the
-    // origin room's node; otherwise begin at a building entrance.
-    IndoorNodeModel originStart() =>
-        _srcRoomNode(nodes) ??
-        _firstWhere(navigable, (n) => n.isEntrance) ??
-        navigable.first;
-
-    late IndoorNodeModel start;
+    IndoorNodeModel? start;
     // true → pick whichever destination-room node is NEAREST by graph
     // distance; false → the end node is a fixed transport node.
     late bool targetIsRoom;
     IndoorNodeModel? fixedEnd;
+    final origin = _originStartNode(nodes);
+
+    void noStartNode() {
+      debugPrint('❌ The start node is not on floor plan ${plan.id}');
+      _pathPixels = const [];
+      _startPixel = null;
+      _endPixel = null;
+      _indoorError = _startNotFoundMessage;
+    }
 
     if (!_needsTwoFloors) {
-      start = originStart();
+      if (origin == null) return noStartNode();
+      start = origin;
       targetIsRoom = true;
       debugPrint('   Single floor: origin → destination room');
-    } else if (_indoorFloorStep == 0) {
-      start = originStart();
-      fixedEnd = _nearestByLabel(nodes, transportLabel, start) ?? navigable.last;
-      targetIsRoom = false;
-      debugPrint('   Start floor: origin → nearest $transportLabel');
     } else {
-      final approxRoom = _destRoomNode(nodes) ?? navigable.last;
-      start =
-          _nearestByLabel(nodes, transportLabel, approxRoom) ?? navigable.first;
-      targetIsRoom = true;
-      debugPrint('   Destination floor: $transportLabel → destination room');
+      // Both legs use the SAME stair/elevator group (chosen in
+      // _chooseTransport) — never a per-floor guess.
+      final choice = _transportChoice;
+      if (choice == null) {
+        _pathPixels = const [];
+        _startPixel = null;
+        _endPixel = null;
+        _indoorError = _noTransportMessage;
+        return;
+      }
+      if (_indoorFloorStep == 0) {
+        if (origin == null) return noStartNode();
+        start = origin;
+        fixedEnd = nodeById[choice.startFloorNode.id] ?? choice.startFloorNode;
+        targetIsRoom = false;
+        debugPrint('   Start floor: origin → ${choice.group}');
+      } else {
+        start = nodeById[choice.destFloorNode.id] ?? choice.destFloorNode;
+        targetIsRoom = true;
+        debugPrint('   Destination floor: ${choice.group} → destination room');
+      }
     }
 
     debugPrint('   Start node: ${start.id} '
@@ -226,7 +611,8 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     _startPixel = Offset(start.x, start.y);
 
     // One Dijkstra sweep from the start; reused to score every candidate end.
-    final dij = _indoorDijkstra(nodes: nodes, edges: edges, fromId: start.id);
+    final dij = DijkstraService.indoorDistances(
+        nodes: nodes, edges: edges, fromId: start.id);
 
     void unreachable() {
       debugPrint('❌ Indoor destination unreachable — check that the nodes '
@@ -254,9 +640,17 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
 
     IndoorNodeModel? end;
     if (targetIsRoom) {
+      final candidates = _destRoomCandidates(nodes);
+      if (candidates.isEmpty) {
+        debugPrint('❌ Destination room has no node on this floor plan');
+        _pathPixels = const [];
+        _endPixel = null;
+        _indoorError = _roomNotMappedMessage;
+        return;
+      }
       // Pick the destination-room node with the SHORTEST path from the start.
       var bestDist = double.infinity;
-      for (final c in _destRoomCandidates(nodes)) {
+      for (final c in candidates) {
         final d = dij.dist[c.id] ?? double.infinity;
         debugPrint('   Dest candidate ${c.id} (${c.displayLabel}): '
             'dist=${d.isFinite ? d.toStringAsFixed(1) : "∞"}');
@@ -265,7 +659,11 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
           end = c;
         }
       }
-      end ??= navigable.last;
+      if (end == null) {
+        // Candidates exist but none is connected to the start.
+        unreachable();
+        return;
+      }
       debugPrint('✅ Nearest destination node: ${end.id} '
           '(dist ${bestDist.isFinite ? bestDist.toStringAsFixed(1) : "∞"})');
     } else {
@@ -289,9 +687,95 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     _pathPixels = pathNodes.map((n) => Offset(n.x, n.y)).toList();
     _instructions = _generateIndoorInstructions(_pathPixels);
     _currentStep = 0;
+    final named = {
+      for (final n in pathNodes)
+        if ((n.roomNumber ?? n.roomName)?.trim().isNotEmpty == true)
+          Offset(n.x, n.y): (n.roomNumber ?? n.roomName)!.trim(),
+    };
+    _stepLandmarks = [for (final s in _instructions) named[s.fromPoint]];
+    if (_indoorFloorStep == 0) _startFloorTextSteps = _textSteps().length;
+    // Error-rate denominator: outdoor steps + every indoor floor leg.
+    _indoorStepCounts[_indoorFloorStep] = _instructions.length;
+    _analytics.totalSteps =
+        _outdoorSteps + _indoorStepCounts.values.fold(0, (a, b) => a + b);
     debugPrint('✅ Indoor path: ${pathNodes.length} nodes → '
         '${pathNodes.map((n) => n.id).join(" → ")}');
     debugPrint('   Instructions: ${_instructions.length} steps');
+  }
+
+  /// Where the indoor route starts on the start floor: the chosen entrance's
+  /// indoor node, else the origin room's node for room → room trips. Null
+  /// when neither is on [nodes] — never another node in its place.
+  IndoorNodeModel? _originStartNode(List<IndoorNodeModel> nodes) {
+    final entrance = _startEntrance?.indoorNode;
+    if (entrance != null) return _firstWhere(nodes, (n) => n.id == entrance.id);
+    return _srcRoomNode(nodes);
+  }
+
+  /// Two-floor trips: picks ONE stairs/elevator group present on both the
+  /// start and destination floors (shortest total route) and stores it in
+  /// [_transportChoice]. Returns an error message, or null on success.
+  Future<String?> _chooseTransport() async {
+    final repo = context.read<IndoorNavigationRepository>();
+    final transport =
+        _route.selectedTransport == 'elevator' ? 'elevator' : 'stairs';
+    try {
+      final startId = _startPlan!.id.toString();
+      final destId = _destPlan!.id.toString();
+      final startNodes = await repo.getNodesForFloor(startId);
+      final startEdges = await repo.getEdgesForFloor(startId);
+      final destNodes = await repo.getNodesForFloor(destId);
+      final destEdges = await repo.getEdgesForFloor(destId);
+
+      if (!startNodes.any((n) => n.isNavigable) ||
+          !destNodes.any((n) => n.isNavigable)) {
+        return 'No indoor nodes found for this floor.';
+      }
+      final roomCandidates = _destRoomCandidates(destNodes);
+      if (roomCandidates.isEmpty) return _roomNotMappedMessage;
+
+      final start = _originStartNode(startNodes);
+      if (start == null) return _startNotFoundMessage;
+      final fromStart = DijkstraService.indoorDistances(
+          nodes: startNodes, edges: startEdges, fromId: start.id);
+
+      // Destination-floor cost: transport node → nearest room candidate.
+      final destCost = <String, double>{};
+      double costFromTransport(IndoorNodeModel n) => destCost.putIfAbsent(n.id,
+          () {
+            final dij = DijkstraService.indoorDistances(
+                nodes: destNodes, edges: destEdges, fromId: n.id);
+            if (dij == null) return double.infinity;
+            var best = double.infinity;
+            for (final c in roomCandidates) {
+              best = math.min(best, dij.dist[c.id] ?? double.infinity);
+            }
+            return best;
+          });
+
+      final choice = chooseStairGroup(
+        startFloorNodes: startNodes,
+        destFloorNodes: destNodes,
+        transport: transport,
+        costToTransport: (n) => fromStart?.dist[n.id] ?? double.infinity,
+        costFromTransport: costFromTransport,
+      );
+      if (choice == null) {
+        debugPrint('❌ No $transport stair_group common to floors '
+            '${_startPlan!.floorNumber} and ${_destPlan!.floorNumber}');
+        return _noTransportMessage;
+      }
+      debugPrint('✅ Using ${choice.group}: ${choice.startFloorNode.id} → '
+          '${choice.destFloorNode.id} (cost ${choice.totalCost.toStringAsFixed(1)})');
+      _transportChoice = choice;
+      return null;
+    } on RepositoryException catch (e) {
+      debugPrint('❌ Transport selection failed: $e');
+      return e.message;
+    } catch (e) {
+      debugPrint('❌ Transport selection failed: $e');
+      return 'Could not load the floor plans.';
+    }
   }
 
   void _onArrivedAtRoom() => _onArrived();
@@ -304,8 +788,8 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     final plan = (_indoorFloorStep == 0 || !_needsTwoFloors)
         ? _startPlan
         : _destPlan;
-    final s = plan?.scaleFactor ?? 0;
-    return (s > 0 && s < 0.5) ? s : 0.05;
+    return plan?.effectiveMetersPerPixel ??
+        FloorPlanModel.defaultMetersPerPixel;
   }
 
   List<IndoorInstruction> _generateIndoorInstructions(
@@ -343,6 +827,9 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
         instructions.add(IndoorInstruction(
           instructionText:
               _buildIndoorText(currentDir, segmentDist, distMeters, isLast),
+          walkText: distMeters >= 1
+              ? _buildIndoorText(currentDir, segmentDist, distMeters, false)
+              : null,
           directionIcon: _indoorIcon(isLast ? 'arrive' : currentDir),
           distancePixels: segmentDist,
           distanceMeters: distMeters,
@@ -432,84 +919,6 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     }
   }
 
-  /// Dijkstra over the indoor edge graph. Returns the ordered nodes from
-  /// [fromId] to [toId], following `indoor_edges`; null if unreachable.
-  /// Full Dijkstra over the indoor edge graph from [fromId] — returns the
-  /// shortest distance and predecessor for EVERY node (so the caller can pick
-  /// the nearest of several destination candidates). null = graph unusable.
-  ({Map<String, double> dist, Map<String, String?> prev})? _indoorDijkstra({
-    required List<IndoorNodeModel> nodes,
-    required List<IndoorEdgeModel> edges,
-    required String fromId,
-  }) {
-    final nodeById = {for (final n in nodes) n.id: n};
-    if (!nodeById.containsKey(fromId)) {
-      debugPrint('❌ Start node id is not in the node list');
-      return null;
-    }
-
-    // adjacency: nodeId → [(neighbourId, weight), …]
-    final adjacency = <String, List<MapEntry<String, double>>>{
-      for (final n in nodes) n.id: <MapEntry<String, double>>[],
-    };
-
-    var edgesAdded = 0;
-    for (final e in edges) {
-      if (!e.isActive) continue;
-      final a = nodeById[e.fromNode];
-      final b = nodeById[e.toNode];
-      if (a == null || b == null) continue;
-      if (!a.isNavigable || !b.isNavigable) continue;
-      final w = e.weight > 0 ? e.weight : (a.position - b.position).distance;
-      adjacency[e.fromNode]!.add(MapEntry(e.toNode, w));
-      if (e.isTwoWay) {
-        adjacency[e.toNode]!.add(MapEntry(e.fromNode, w));
-      }
-      edgesAdded++;
-    }
-
-    debugPrint('🧭 Indoor Dijkstra from $fromId');
-    debugPrint('   Edges wired into graph: $edgesAdded / ${edges.length}');
-    debugPrint('   Start neighbours: ${adjacency[fromId]!.length}');
-
-    if (edgesAdded == 0) {
-      debugPrint('❌ No usable edges — every node is isolated.');
-      return null;
-    }
-
-    final dist = <String, double>{
-      for (final id in adjacency.keys) id: double.infinity,
-    };
-    final prev = <String, String?>{};
-    dist[fromId] = 0;
-    final unvisited = Set<String>.from(adjacency.keys);
-
-    while (unvisited.isNotEmpty) {
-      String? current;
-      var minDist = double.infinity;
-      for (final id in unvisited) {
-        final d = dist[id]!;
-        if (d < minDist) {
-          minDist = d;
-          current = id;
-        }
-      }
-      if (current == null || minDist == double.infinity) break;
-
-      unvisited.remove(current);
-      for (final edge in adjacency[current]!) {
-        if (!unvisited.contains(edge.key)) continue;
-        final nd = minDist + edge.value;
-        if (nd < dist[edge.key]!) {
-          dist[edge.key] = nd;
-          prev[edge.key] = current;
-        }
-      }
-    }
-
-    return (dist: dist, prev: prev);
-  }
-
   List<IndoorNodeModel> _reconstructIndoor(
     Map<String, String?> prev,
     Map<String, IndoorNodeModel> nodeById,
@@ -528,15 +937,19 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
   }
 
   /// Every navigable node that could be the destination room's entrance —
-  /// linked by `linked_room_id` first, else by room number / label / name.
+  /// the exact indoor node (search results), else nodes linked by
+  /// `linked_room_id` + `linked_table`, else by room number / label / name.
   List<IndoorNodeModel> _destRoomCandidates(List<IndoorNodeModel> nodes) {
+    final exact = _exactNode(nodes, _route.to);
+    if (exact != null) return [exact];
+
     final targetId = _route.to['id']?.toString();
+    final targetType = _route.to['type']?.toString();
     final targetName = (_route.destRoomName ?? '').toLowerCase().trim();
 
     if (targetId != null) {
       final linked = nodes
-          .where((n) =>
-              n.isNavigable && n.linkedRoomId?.toString() == targetId)
+          .where((n) => n.isNavigable && nodeLinksTo(n, targetId, targetType))
           .toList();
       if (linked.isNotEmpty) return linked;
     }
@@ -555,6 +968,18 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     return const [];
   }
 
+  /// The endpoint's own indoor node, when it came from an indoor-node search
+  /// result (`indoor_node_id`) and that node is navigable on this floor.
+  IndoorNodeModel? _exactNode(
+      List<IndoorNodeModel> nodes, Map<String, dynamic> endpoint) {
+    final nodeId = endpoint['indoor_node_id']?.toString();
+    if (nodeId == null) return null;
+    for (final n in nodes) {
+      if (n.id == nodeId && n.isNavigable) return n;
+    }
+    return null;
+  }
+
   IndoorNodeModel? _firstWhere(
       List<IndoorNodeModel> nodes, bool Function(IndoorNodeModel) test) {
     for (final n in nodes) {
@@ -564,44 +989,35 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
   }
 
   /// The origin room's navigable node — only when the trip starts inside a
-  /// room / facility (room → room). Returns null for a building origin so the
-  /// caller falls back to a building entrance.
+  /// room / facility of this building (room → room). Null otherwise.
   IndoorNodeModel? _srcRoomNode(List<IndoorNodeModel> nodes) {
+    if (!_tripStartsInRoom) return null;
     final fromType = (_route.from['type'] ?? 'building').toString();
-    if (fromType != 'room' && fromType != 'facility') return null;
-    return _matchRoomNode(
-      nodes,
-      _route.from['id']?.toString(),
-      (_route.originRoomName ?? _route.fromName ?? '').toLowerCase().trim(),
-      label: 'Start',
-    );
-  }
-
-  /// The destination should be the ROOM ENTRANCE node (a navigable node
-  /// linked to the room), NOT the informational label node.
-  IndoorNodeModel? _destRoomNode(List<IndoorNodeModel> nodes) {
-    return _matchRoomNode(
-      nodes,
-      _route.to['id']?.toString(),
-      (_route.destRoomName ?? '').toLowerCase().trim(),
-      label: 'End',
-    );
+    return _exactNode(nodes, _route.from) ??
+        _matchRoomNode(
+          nodes,
+          _route.from['id']?.toString(),
+          fromType,
+          (_route.originRoomName ?? _route.fromName ?? '').toLowerCase().trim(),
+          label: 'Start',
+        );
   }
 
   IndoorNodeModel? _matchRoomNode(
     List<IndoorNodeModel> nodes,
     String? targetId,
+    String? targetType,
     String targetName, {
     required String label,
   }) {
-    debugPrint('   Looking for $label room node — id: $targetId');
+    debugPrint('   Looking for $label room node — id: $targetId ($targetType)');
 
     if (targetId != null) {
       // Priority 1: navigable ENTRANCE node linked to the room.
       for (final n in nodes) {
         if (n.isNavigable &&
             n.isEntrance &&
-            n.linkedRoomId?.toString() == targetId) {
+            nodeLinksTo(n, targetId, targetType)) {
           debugPrint('✅ $label: room entrance node ${n.id} '
               '(${n.entranceLabel ?? n.displayLabel})');
           return n;
@@ -609,7 +1025,7 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       }
       // Priority 2: any navigable node linked to the room.
       for (final n in nodes) {
-        if (n.isNavigable && n.linkedRoomId?.toString() == targetId) {
+        if (n.isNavigable && nodeLinksTo(n, targetId, targetType)) {
           debugPrint('✅ $label: linked navigable node ${n.id}');
           return n;
         }
@@ -638,23 +1054,6 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     return null;
   }
 
-  IndoorNodeModel? _nearestByLabel(List<IndoorNodeModel> nodes, String label,
-      IndoorNodeModel to) {
-    IndoorNodeModel? best;
-    double bestD = double.infinity;
-    for (final n in nodes) {
-      if (!(n.label ?? '').toLowerCase().contains(label)) continue;
-      final dx = n.x - to.x;
-      final dy = n.y - to.y;
-      final d = dx * dx + dy * dy;
-      if (d < bestD) {
-        bestD = d;
-        best = n;
-      }
-    }
-    return best;
-  }
-
   Future<void> _goToDestinationFloor() async {
     setState(() {
       _indoorFloorStep = 1;
@@ -675,27 +1074,7 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
         final navigator = Navigator.of(context);
-        final shouldLeave = await showDialog<bool>(
-          context: context,
-          builder: (dialogContext) => AlertDialog(
-            title: const Text('Exit Navigation?'),
-            content: const Text(
-                'Are you sure you want to exit navigation?'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext, false),
-                child: const Text('Continue',
-                    style: TextStyle(color: AppColors.primaryMaroon)),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext, true),
-                child: const Text('Exit',
-                    style: TextStyle(color: Colors.grey)),
-              ),
-            ],
-          ),
-        );
-        if (shouldLeave ?? false) navigator.pop();
+        if (await confirmExitNavigation(context)) navigator.pop();
       },
       child: _buildCurrentPhaseScreen(),
     );
@@ -710,9 +1089,9 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       case NavigationPhase.outdoorNavigation:
         return _outdoorScreen();
       case NavigationPhase.elevatorOrStairs:
-        return _transportChoiceScreen();
+        return _startKnown ? _transportChoiceScreen() : _entranceGateScreen();
       case NavigationPhase.indoorNavigation:
-        return _indoorScreen();
+        return _startKnown ? _indoorScreen() : _entranceGateScreen();
       case NavigationPhase.arrived:
         return _arrivedScreen();
     }
@@ -966,6 +1345,116 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
       hasMorePhases: continuesIndoors,
       destBuildingName: _route.destBuildingName,
       onArrivedAtBuilding: _advance,
+      // Outdoor-only trips show their arrival inside the turn-by-turn view.
+      onArrived: continuesIndoors ? null : _completeTrip,
+      tripId: _analytics.tripId,
+    );
+  }
+
+  // ─────────────────── Entrance gate ───────────────────
+
+  /// Shown until the indoor start is known: working it out, a load failure,
+  /// "Choose your entrance", or why indoor directions can't start.
+  Widget _entranceGateScreen() {
+    final decision = _startDecision;
+    final showBusy = _startError == null && decision == null;
+    final message = _startError ??
+        switch (decision?.kind) {
+          IndoorStartKind.notLinked => switch (decision!.entrance) {
+              final entrance? => entranceNotLinkedMessage(entrance.name),
+              null => noEntranceLinkedMessage,
+            },
+          IndoorStartKind.noData => noEntranceDataMessage,
+          _ => null,
+        };
+    final showChooser = _startError == null &&
+        decision != null &&
+        _entrances.any((e) => e.isLinked);
+
+    return Scaffold(
+      backgroundColor: AppColors.backgroundGray,
+      appBar: _appBar(),
+      body: SafeArea(
+        child: showBusy
+            ? const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(color: AppColors.primaryMaroon),
+                    SizedBox(height: 12),
+                    Text('Finding your entrance...',
+                        style: TextStyle(color: AppColors.textSecondary)),
+                  ],
+                ),
+              )
+            : SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(vertical: 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (message != null)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+                        child: Text(message,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                                fontSize: 15, color: AppColors.textPrimary)),
+                      ),
+                    if (showChooser) ...[
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16),
+                        child: Text('Choose your entrance',
+                            style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: AppColors.textPrimary)),
+                      ),
+                      const SizedBox(height: 8),
+                      _EntranceList(
+                        entrances: _entrances,
+                        onSelected: _chooseEntrance,
+                      ),
+                    ],
+                    if (_startError != null)
+                      Center(
+                        child: OutlinedButton(
+                          onPressed: () =>
+                              _enterIndoorPhase(forceRefresh: true),
+                          child: const Text('Retry'),
+                        ),
+                      ),
+                    if (!showChooser && _startError == null)
+                      Center(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppColors.primaryMaroon,
+                            side: const BorderSide(
+                                color: AppColors.primaryMaroon),
+                          ),
+                          child: const Text('Return to Map'),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+      ),
+    );
+  }
+
+  /// The small "Start from" control, to correct the starting entrance.
+  Widget _startFromControl() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: _showEntranceSheet,
+        icon: const Icon(Icons.door_front_door_outlined,
+            size: 16, color: AppColors.primaryMaroon),
+        label: Text('Start from: ${_startEntrance!.name}',
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+                fontSize: 12, color: AppColors.primaryMaroon)),
+      ),
     );
   }
 
@@ -1008,6 +1497,7 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
               style: const TextStyle(
                   fontSize: 14, color: AppColors.textSecondary),
             ),
+            if (_startEntrance != null) _startFromControl(),
             const SizedBox(height: 32),
             Text(
               'How would you like to go to Floor ${_route.destFloor}?',
@@ -1167,7 +1657,8 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
         children: [
           // Direction card sits directly below the AppBar — no phase
           // indicator, no gap.
-          if (showTurnByTurn) _indoorDirectionCard(),
+          if (showTurnByTurn && !_textDirectionsOnly) _indoorDirectionCard(),
+          if (_startEntrance != null && !_indoorLoading) _startFromControl(),
           Expanded(child: _indoorBody()),
           _indoorBottomPanel(onGround, transport),
         ],
@@ -1371,17 +1862,18 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
                   onTapCancel: () =>
                       setState(() => _navPrevPressed = false),
                   onTapUp: (_) {
+                    // One step back; only from the FIRST destination-floor
+                    // step does it return to the start floor (its last step).
+                    final action = indoorPreviousAction(
+                      step: _currentStep,
+                      twoFloors: _needsTwoFloors,
+                      onStartFloor: onGround,
+                    );
                     setState(() {
                       _navPrevPressed = false;
-                      if (_currentStep > 0) {
-                        _currentStep--;
-                      }
+                      if (action == IndoorStepAction.stepBack) _currentStep--;
                     });
-                    // At the first step of the destination floor, "Previous"
-                    // returns to the ground-floor view.
-                    if (_currentStep == 0 &&
-                        _needsTwoFloors &&
-                        !onGround) {
+                    if (action == IndoorStepAction.toStartFloorLastStep) {
                       _returnToGroundFloor();
                     }
                   },
@@ -1420,12 +1912,22 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
                       setState(() => _navNextPressed = false),
                   onTapUp: (_) {
                     setState(() => _navNextPressed = false);
-                    if (finishIsFloorChange) {
-                      _goToDestinationFloor();
-                    } else if (isLastStep) {
-                      _onArrivedAtRoom();
-                    } else {
-                      setState(() => _currentStep++);
+                    switch (indoorNextAction(
+                      step: _currentStep,
+                      stepCount: _instructions.length,
+                      twoFloors: _needsTwoFloors,
+                      onStartFloor: onGround,
+                    )) {
+                      case IndoorStepAction.stepForward:
+                        setState(() => _currentStep++);
+                      case IndoorStepAction.toDestinationFloor:
+                        _goToDestinationFloor();
+                      case IndoorStepAction.arrive:
+                        _onArrivedAtRoom();
+                      case IndoorStepAction.none ||
+                            IndoorStepAction.stepBack ||
+                            IndoorStepAction.toStartFloorLastStep:
+                        break;
                     }
                   },
                   child: AnimatedScale(
@@ -1466,13 +1968,19 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
     );
   }
 
+  /// Back from the first destination-floor step to the LAST step on the
+  /// start floor (one step back, not back to the beginning).
   Future<void> _returnToGroundFloor() async {
     setState(() {
       _indoorFloorStep = 0;
       _indoorLoading = true;
     });
     await _computeStepPath();
-    if (mounted) setState(() => _indoorLoading = false);
+    if (!mounted) return;
+    setState(() {
+      _indoorLoading = false;
+      _currentStep = math.max(0, _instructions.length - 1);
+    });
   }
 
   Widget _indoorBody() {
@@ -1481,21 +1989,15 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
         child: CircularProgressIndicator(color: AppColors.primaryMaroon),
       );
     }
-    if (_indoorError != null) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.wifi_off,
-                size: 48, color: AppColors.textSecondary),
-            const SizedBox(height: 8),
-            Text(_indoorError!,
-                style: const TextStyle(color: AppColors.textSecondary)),
-            const SizedBox(height: 12),
-            OutlinedButton(
-                onPressed: _loadIndoor, child: const Text('Retry')),
-          ],
-        ),
+    if (_indoorError != null) return _indoorErrorView();
+
+    if (_textDirectionsOnly) {
+      final steps = _textSteps();
+      final onDestFloor = _needsTwoFloors && _indoorFloorStep == 1;
+      return VisitorIndoorSteps(
+        steps: steps,
+        firstNumber: onDestFloor ? _startFloorTextSteps + 1 : 1,
+        current: steps.isEmpty ? 0 : _currentStep.clamp(0, steps.length - 1),
       );
     }
 
@@ -1526,6 +2028,44 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
           : _instructions[_currentStep.clamp(0, _instructions.length - 1)]
               .segmentPoints,
       completedSegment: _completedIndoorPoints(),
+    );
+  }
+
+  /// This floor's route as written steps, from the same [_instructions] the
+  /// 2D screen steps through.
+  List<String> _textSteps() {
+    final toNextFloor = _needsTwoFloors && _indoorFloorStep == 0;
+    final transport =
+        _route.selectedTransport == 'elevator' ? 'elevator' : 'stairs';
+    return indoorTextSteps(
+      steps: [for (final s in _instructions) s.instructionText],
+      lastWalk: _instructions.isEmpty ? null : _instructions.last.walkText,
+      landmarks: _stepLandmarks,
+      finish: toNextFloor
+          ? changeFloorStep(transport, _route.destFloor)
+          : arrivalStep(_route.destRoomName),
+    );
+  }
+
+  Widget _indoorErrorView() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.wifi_off, size: 48, color: AppColors.textSecondary),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(_indoorError!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: AppColors.textSecondary)),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+              onPressed: () => _loadIndoor(forceRefresh: true),
+              child: const Text('Retry')),
+        ],
+      ),
     );
   }
 
@@ -1579,25 +2119,31 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
               const SizedBox(height: 48),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 32),
-                child: SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton.icon(
-                    onPressed: () {
-                      final router = GoRouter.of(context);
-                      Navigator.of(context).pop();
-                      router.push('/survey');
-                    },
-                    icon: const Icon(Icons.star_outline,
-                        color: AppColors.primaryMaroon),
-                    label: const Text('Rate Your Experience',
-                        style: TextStyle(
-                            color: AppColors.primaryMaroon,
-                            fontWeight: FontWeight.bold)),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.accentGold,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                child: ArrivalFeedback(
+                  tripId: _analytics.tripId,
+                  onRate: () async {
+                    final router = GoRouter.of(context);
+                    final tripId = _analytics.tripId;
+                    Navigator.of(context).pop();
+                    router.push('/survey',
+                        extra: {'navigation_session_id': tripId});
+                  },
+                  rateButton: (onPressed) => SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: ElevatedButton.icon(
+                      onPressed: onPressed,
+                      icon: const Icon(Icons.star_outline,
+                          color: AppColors.primaryMaroon),
+                      label: const Text('Rate Your Experience',
+                          style: TextStyle(
+                              color: AppColors.primaryMaroon,
+                              fontWeight: FontWeight.bold)),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.accentGold,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12)),
+                      ),
                     ),
                   ),
                 ),
@@ -1627,9 +2173,49 @@ class _MultiPhaseNavScreenState extends State<MultiPhaseNavScreen> {
   }
 }
 
+/// This building's entrances. One with no indoor node is shown but can't be
+/// picked, with the reason.
+class _EntranceList extends StatelessWidget {
+  final List<BuildingEntrance> entrances;
+  final BuildingEntrance? selected;
+  final ValueChanged<BuildingEntrance> onSelected;
+
+  const _EntranceList({
+    required this.entrances,
+    required this.onSelected,
+    this.selected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final e in entrances)
+          ListTile(
+            enabled: e.isLinked,
+            leading: const Icon(Icons.door_front_door_outlined),
+            iconColor: AppColors.primaryMaroon,
+            title: Text(e.name),
+            subtitle:
+                Text(e.isLinked ? e.plan!.tabLabel : entranceNotLinkedLabel),
+            trailing: identical(e, selected)
+                ? const Icon(Icons.check, color: AppColors.successGreen)
+                : null,
+            onTap: e.isLinked ? () => onSelected(e) : null,
+          ),
+      ],
+    );
+  }
+}
+
 /// One merged turn-by-turn step across the indoor floor plan.
 class IndoorInstruction {
   final String instructionText;
+
+  /// The walk this step covers, for a step whose [instructionText] doesn't
+  /// say (the last one). Null when it is too short to mention.
+  final String? walkText;
   final IconData directionIcon;
   final double distancePixels;
   final double distanceMeters;
@@ -1639,6 +2225,7 @@ class IndoorInstruction {
 
   const IndoorInstruction({
     required this.instructionText,
+    this.walkText,
     required this.directionIcon,
     required this.distancePixels,
     required this.distanceMeters,

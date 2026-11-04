@@ -10,13 +10,7 @@
 	<string>UM-AR Nav</string>
 	<key>NSCameraUsageDescription</key>
 	<string>UM-AR Nav uses camera for AR navigation view</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>UM-AR Nav needs photo access to upload floor plan images</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>UM-AR Nav needs your location to verify you are inside the University of Mindanao Matina Campus.</string>
-	<key>NSLocationAlwaysUsageDescription</key>
-	<string>UM-AR Nav needs your location to verify you are inside the University of Mindanao Matina Campus.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>UM-AR Nav needs your location to verify you are inside the University of Mindanao Matina Campus.</string>
 	<!-- Google Sign-In: replace with the iOS OAuth client id and its
 	     reversed form (REVERSED_CLIENT_ID) from Google Cloud Console. -->

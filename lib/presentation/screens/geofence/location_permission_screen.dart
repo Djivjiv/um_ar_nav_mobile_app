@@ -5,6 +5,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/geofence_service.dart';
+import '../../../core/utils/session_service.dart';
+import '../../../data/repositories/visitor_session_repository.dart';
 
 class LocationPermissionScreen extends StatefulWidget {
   const LocationPermissionScreen({super.key});
@@ -44,8 +46,8 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
       await Supabase.instance.client.auth.signOut();
     } catch (_) {}
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('visitor_session_id');
-    await prefs.remove('login_time');
+    await prefs.remove(VisitorSessionRepository.storageKey);
+    await prefs.remove(SessionService.loginTimeKey);
     if (mounted) context.go('/login');
   }
 

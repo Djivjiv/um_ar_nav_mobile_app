@@ -1,14 +1,29 @@
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../local/offline_cache.dart';
+import '../local/pending_write_queue.dart';
 import '../models/outdoor_node_model.dart';
 import '../models/outdoor_edge_model.dart';
+import 'paging.dart';
 import 'repository_exception.dart';
 
-/// Loads and caches the outdoor navigation graph. Fetched once on app start.
+/// Loads and caches the outdoor navigation graph. Fetched once on app start;
+/// offline, the last saved copy is used.
 class OutdoorNavigationRepository {
   final SupabaseClient _client;
-  OutdoorNavigationRepository([SupabaseClient? client])
-      : _client = client ?? Supabase.instance.client;
+  final OfflineCache _offline;
+  final PendingWriteQueue _queue;
+  OutdoorNavigationRepository([
+    SupabaseClient? client,
+    OfflineCache? offline,
+    PendingWriteQueue? queue,
+  ])  : _client = client ?? Supabase.instance.client,
+        _offline = offline ?? OfflineCache.instance,
+        _queue = queue ?? PendingWriteQueue.instance;
+
+  static const String nodesCacheKey = 'outdoor_nodes';
+  static const String edgesCacheKey = 'outdoor_edges';
 
   List<OutdoorNodeModel> _nodes = const [];
   List<OutdoorEdgeModel> _edges = const [];
@@ -21,20 +36,30 @@ class OutdoorNavigationRepository {
   Future<void> loadGraph({bool forceRefresh = false}) async {
     if (_loaded && !forceRefresh) return;
     try {
-      final nodeRows = await _client
-          .from('outdoor_nodes')
-          .select()
-          .eq('is_active', true);
-      final edgeRows = await _client
-          .from('outdoor_edges')
-          .select()
-          .eq('is_active', true);
+      final nodeRows = await _offline.fetch<List<dynamic>>(
+        nodesCacheKey,
+        () => fetchAllPages((from, to) async => await _client
+            .from('outdoor_nodes')
+            .select()
+            .eq('is_active', true)
+            .order('id')
+            .range(from, to)),
+      );
+      final edgeRows = await _offline.fetch<List<dynamic>>(
+        edgesCacheKey,
+        () => fetchAllPages((from, to) async => await _client
+            .from('outdoor_edges')
+            .select()
+            .eq('is_active', true)
+            .order('id')
+            .range(from, to)),
+      );
 
-      _nodes = (nodeRows as List)
+      _nodes = nodeRows
           .map((e) => OutdoorNodeModel.fromMap(e as Map<String, dynamic>))
           .where((n) => n.lat != 0 && n.lng != 0)
           .toList();
-      _edges = (edgeRows as List)
+      _edges = edgeRows
           .map((e) => OutdoorEdgeModel.fromMap(e as Map<String, dynamic>))
           .toList();
       _loaded = true;
@@ -59,33 +84,16 @@ class OutdoorNavigationRepository {
     return best;
   }
 
-  Future<void> logNavigationSession({
-    String? userId,
-    String? visitorSessionId,
-    required String fromNode,
-    required String toNode,
-    required String fromName,
-    required String toName,
-    required double distanceMeters,
-    int? durationSeconds,
-    bool completed = false,
-  }) async {
+  /// Queues a `navigation_sessions` row (built by NavigationSessionLogger)
+  /// and tries to send it. Offline, it stays queued and is sent when the
+  /// connection returns. Never throws.
+  Future<void> logNavigationRow(Map<String, dynamic> row) async {
     try {
-      await _client.from('navigation_sessions').insert({
-        'user_id': userId,
-        'visitor_session_id': visitorSessionId,
-        'from_node': fromNode,
-        'to_node': toNode,
-        'from_name': fromName,
-        'to_name': toName,
-        'distance_meters': distanceMeters,
-        'duration_seconds': durationSeconds,
-        'completed': completed,
-        'started_at': DateTime.now().toIso8601String(),
-        if (completed) 'completed_at': DateTime.now().toIso8601String(),
-      });
-    } catch (_) {
-      // Non-critical analytics write; ignore failures.
+      await _queue.enqueue('navigation_sessions', row);
+      await _queue.flush();
+    } catch (e) {
+      // Non-critical analytics write; never break navigation.
+      debugPrint('Navigation log not queued: $e');
     }
   }
 }

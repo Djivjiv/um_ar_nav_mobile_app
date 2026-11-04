@@ -1,13 +1,15 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-import 'package:supabase_flutter/supabase_flutter.dart' show Supabase;
 
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/facility_category.dart';
 import '../../../core/utils/navigation_preference.dart';
 import '../../../data/models/building_model.dart';
 import '../../../data/models/facility_model.dart';
+import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/facility_repository.dart';
 import 'facility_detail_page.dart';
 
 enum _Status { loading, loaded, error }
@@ -78,32 +80,15 @@ class _PlacesScreenState extends State<PlacesScreen> {
   Future<void> _load() async {
     setState(() => _status = _Status.loading);
     try {
-      final supabase = Supabase.instance.client;
-
-      final buildingRows = await supabase
-          .from('buildings')
-          .select('id, name, short_name, lat, lng, floor_count, '
-              'opening_hours, contact, image_url, is_active')
-          .eq('is_active', true)
-          .order('name');
-
-      final facilityRows = await supabase.from('facilities').select('''
-            *,
-            buildings(id, name),
-            facility_details(
-              id, facility_id, office_hours, contact_number,
-              services, payment_method, instructions
-            )
-          ''').order('roomname');
-
-      final buildings = (buildingRows as List)
-          .map((e) => BuildingModel.fromMap(e as Map<String, dynamic>))
-          .where((b) => b.lat != 0 && b.lng != 0)
-          .toList();
+      // Repositories fall back to the saved offline copy without a connection.
+      final facilityRepo = context.read<FacilityRepository>();
+      final buildings = await context
+          .read<BuildingRepository>()
+          .getBuildings(forceRefresh: true);
+      final facilityRows = await facilityRepo.getAllFacilityRows();
 
       final facilities = <_FacilityEntry>[];
-      for (final row in (facilityRows as List)) {
-        final m = row as Map<String, dynamic>;
+      for (final m in facilityRows) {
         final detailsRaw = m['facility_details'];
         FacilityDetailsModel? details;
         if (detailsRaw is List && detailsRaw.isNotEmpty) {
@@ -367,6 +352,7 @@ class _PlacesScreenState extends State<PlacesScreen> {
           if (i < buildings.length) {
             return _BuildingCard(
               building: buildings[i],
+              onTap: () => context.push('/building/${buildings[i].id}'),
               onNavigate: () => _navigateToBuilding(buildings[i]),
             );
           }
@@ -382,10 +368,12 @@ class _PlacesScreenState extends State<PlacesScreen> {
 
 class _BuildingCard extends StatelessWidget {
   final BuildingModel building;
+  final VoidCallback onTap;
   final VoidCallback onNavigate;
 
   const _BuildingCard({
     required this.building,
+    required this.onTap,
     required this.onNavigate,
   });
 
@@ -401,88 +389,97 @@ class _BuildingCard extends StatelessWidget {
         ],
       ),
       clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            height: 160,
-            width: double.infinity,
-            child: building.firstImage != null
-                ? CachedNetworkImage(
-                    imageUrl: building.firstImage!,
-                    fit: BoxFit.cover,
-                    placeholder: (_, _) => _placeholder(),
-                    errorWidget: (_, _, _) => _placeholder(),
-                  )
-                : _placeholder(),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          child: _details(),
+        ),
+      ),
+    );
+  }
+
+  Widget _details() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 160,
+          width: double.infinity,
+          child: building.firstImage != null
+              ? CachedNetworkImage(
+                  imageUrl: building.firstImage!,
+                  fit: BoxFit.cover,
+                  placeholder: (_, _) => _placeholder(),
+                  errorWidget: (_, _, _) => _placeholder(),
+                )
+              : _placeholder(),
+        ),
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(building.label,
+                        style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.textPrimary)),
+                  ),
+                  if (!kNoRooms)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: AppColors.backgroundGray,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text('${building.floorCount} floor(s)',
+                          style: const TextStyle(
+                              fontSize: 11,
+                              color: AppColors.textSecondary)),
+                    ),
+                ],
+              ),
+              if ((building.openingHours ?? '').isNotEmpty) ...[
+                const SizedBox(height: 6),
                 Row(
                   children: [
+                    const Icon(Icons.access_time,
+                        size: 14, color: AppColors.textSecondary),
+                    const SizedBox(width: 6),
                     Expanded(
-                      child: Text(building.label,
+                      child: Text(building.openingHours!,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
-                              color: AppColors.textPrimary)),
+                              fontSize: 12,
+                              color: AppColors.textSecondary)),
                     ),
-                    if (!kNoRooms)
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 3),
-                        decoration: BoxDecoration(
-                          color: AppColors.backgroundGray,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text('${building.floorCount} floor(s)',
-                            style: const TextStyle(
-                                fontSize: 11,
-                                color: AppColors.textSecondary)),
-                      ),
                   ],
                 ),
-                if ((building.openingHours ?? '').isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      const Icon(Icons.access_time,
-                          size: 14, color: AppColors.textSecondary),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text(building.openingHours!,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                fontSize: 12,
-                                color: AppColors.textSecondary)),
-                      ),
-                    ],
-                  ),
-                ],
-                const SizedBox(height: 10),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: ElevatedButton(
-                    onPressed: onNavigate,
-                    style: ElevatedButton.styleFrom(
-                      minimumSize: const Size(0, 36),
-                      padding:
-                          const EdgeInsets.symmetric(horizontal: 16),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10)),
-                    ),
-                    child: const Text('Navigate'),
-                  ),
-                ),
               ],
-            ),
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: ElevatedButton(
+                  onPressed: onNavigate,
+                  style: ElevatedButton.styleFrom(
+                    minimumSize: const Size(0, 36),
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                  ),
+                  child: const Text('Navigate'),
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 

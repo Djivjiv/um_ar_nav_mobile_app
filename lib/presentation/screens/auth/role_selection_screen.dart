@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:go_router/go_router.dart';
 
+import '../../../core/config/email_role_config.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/geofence_service.dart';
 import '../../bloc/auth/auth_cubit.dart';
@@ -27,17 +27,22 @@ class RoleSelectionScreen extends StatefulWidget {
   State<RoleSelectionScreen> createState() => _RoleSelectionScreenState();
 }
 
-class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
+class _RoleSelectionScreenState extends State<RoleSelectionScreen>
+    with CampusGate {
   String? _selected;
-  bool _gating = false;
 
-  Future<void> _gateToMap() async {
-    if (_gating) return;
-    _gating = true;
-    final inside = await GeofenceService.gate(context);
-    if (inside && mounted) context.go('/map');
-    _gating = false;
+  @override
+  void initState() {
+    super.initState();
+    final state = context.read<AuthCubit>().state;
+    if (state is AuthNeedsRoleSelection &&
+        EmailRoleConfig.classify(state.user.email) ==
+            SchoolEmailKind.faculty) {
+      _selected = 'faculty';
+    }
   }
+
+  void _save() => context.read<AuthCubit>().selectRole(_selected!);
 
   @override
   Widget build(BuildContext context) {
@@ -45,15 +50,11 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
       backgroundColor: Colors.white,
       body: BlocConsumer<AuthCubit, AuthState>(
         listener: (context, state) {
-          if (state is AuthAuthenticated) {
-            _gateToMap();
-          } else if (state is AuthError) {
-            ScaffoldMessenger.of(context)
-                .showSnackBar(SnackBar(content: Text(state.message)));
-          }
+          if (state is AuthAuthenticated) gateToMap();
         },
         builder: (context, state) {
-          final saving = state is AuthLoading;
+          final saving = state is AuthNeedsRoleSelection && state.saving;
+          final error = state is AuthNeedsRoleSelection ? state.error : null;
           final user = state is AuthNeedsRoleSelection
               ? state.user
               : (state is AuthAuthenticated ? state.user : null);
@@ -117,7 +118,8 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    'This helps us personalize your experience',
+                    'An admin will approve your account before you can use '
+                    'the app.',
                     style: TextStyle(
                         fontSize: 13, color: AppColors.textSecondary),
                   ),
@@ -130,15 +132,12 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                           onTap: () => setState(() => _selected = r.value),
                         ),
                       )),
+                  if (error != null) _SaveError(message: error, onRetry: _save),
                   const SizedBox(height: 12),
                   SizedBox(
                     height: 52,
                     child: ElevatedButton(
-                      onPressed: (_selected == null || saving)
-                          ? null
-                          : () => context
-                              .read<AuthCubit>()
-                              .selectRole(_selected!),
+                      onPressed: (_selected == null || saving) ? null : _save,
                       child: saving
                           ? const SizedBox(
                               width: 22,
@@ -157,6 +156,28 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+class _SaveError extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+
+  const _SaveError({required this.message, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        const Icon(Icons.error_outline, color: AppColors.errorRed),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(message,
+              style: const TextStyle(fontSize: 13, color: AppColors.errorRed)),
+        ),
+        TextButton(onPressed: onRetry, child: const Text('Retry')),
+      ],
     );
   }
 }

@@ -13,6 +13,10 @@ class SearchState {
   /// Consumed (cleared) by the map once handled.
   final Map<String, dynamic>? pickedPlace;
 
+  /// A warning to show above the results (e.g. closed places couldn't be
+  /// checked), or null.
+  final String? notice;
+
   const SearchState({
     required this.status,
     this.query = '',
@@ -20,6 +24,7 @@ class SearchState {
     this.rooms = const [],
     this.indoorNodes = const [],
     this.pickedPlace,
+    this.notice,
   });
 
   const SearchState.initial() : this(status: SearchStatus.initial);
@@ -35,6 +40,8 @@ class SearchState {
     List<IndoorNodeModel>? indoorNodes,
     Map<String, dynamic>? pickedPlace,
     bool clearPickedPlace = false,
+    // Not carried over: a notice belongs to one set of results.
+    String? notice,
   }) {
     return SearchState(
       status: status ?? this.status,
@@ -44,6 +51,7 @@ class SearchState {
       indoorNodes: indoorNodes ?? this.indoorNodes,
       pickedPlace:
           clearPickedPlace ? null : (pickedPlace ?? this.pickedPlace),
+      notice: notice,
     );
   }
 }

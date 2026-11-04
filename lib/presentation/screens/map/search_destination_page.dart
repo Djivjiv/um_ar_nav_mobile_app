@@ -8,9 +8,14 @@ import '../../../core/constants/app_colors.dart';
 class SearchDestinationPage extends StatefulWidget {
   final List<Map<String, dynamic>> destinations;
 
+  /// A choice kept above the results whatever the search or filter, e.g.
+  /// "My location" when picking a start.
+  final Map<String, dynamic>? pinned;
+
   const SearchDestinationPage({
     super.key,
     required this.destinations,
+    this.pinned,
   });
 
   @override
@@ -110,6 +115,15 @@ class _SearchDestinationPageState extends State<SearchDestinationPage> {
             ),
           ),
           const Divider(height: 1),
+          if (widget.pinned case final pinned?)
+            ListTile(
+              tileColor: Colors.white,
+              leading: Icon(pinned['icon'] as IconData,
+                  color: pinned['color'] as Color),
+              title: Text(pinned['name'] as String),
+              subtitle: Text(pinned['subtitle'] as String),
+              onTap: () => Navigator.of(context).pop(pinned),
+            ),
           Padding(
             padding:
                 const EdgeInsets.symmetric(horizontal: 16, vertical: 8),

@@ -1,5 +1,10 @@
 import 'package:latlong2/latlong.dart';
 
+/// A GPS fix further than this from every path node or entrance is not on
+/// campus (e.g. testing at home with the geofence off), so it says nothing
+/// about where a route starts.
+const double maxOnCampusGpsMeters = 150;
+
 // University of Mindanao Matina Campus — complete boundary polygon.
 // Source: geojson.io traced from satellite map.
 const List<LatLng> campusPolygon = [

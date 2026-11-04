@@ -35,6 +35,10 @@ class NavigationRoute {
 
   // Outdoor path.
   final List<LatLng> outdoorPath;
+
+  /// The last `outdoor_nodes` id of the outdoor route — the entrance the user
+  /// arrives at. Null when the trip has no outdoor leg.
+  final String? arrivalOutdoorNodeId;
   final String? fromName;
   final String? toName;
   final double? distanceMeters;
@@ -60,6 +64,7 @@ class NavigationRoute {
     this.destRoomName,
     this.destFloor,
     this.outdoorPath = const [],
+    this.arrivalOutdoorNodeId,
     this.fromName,
     this.toName,
     this.distanceMeters,
@@ -134,6 +139,17 @@ class NavigationRoute {
       return const [
         NavigationPhase.exitOriginBuilding,
         NavigationPhase.outdoorNavigation,
+        NavigationPhase.arrived,
+      ];
+    }
+
+    // Building → room in that same building: already there, no outdoor leg.
+    // The stairs / elevator step is skipped once the entrance's floor is
+    // known to be the destination floor.
+    if (fromType == 'building' && _isIndoor(toType) && sameBuilding) {
+      return const [
+        NavigationPhase.elevatorOrStairs,
+        NavigationPhase.indoorNavigation,
         NavigationPhase.arrived,
       ];
     }

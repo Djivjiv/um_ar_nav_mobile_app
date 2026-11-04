@@ -1,16 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/constants/app_colors.dart';
+import '../../../data/models/feedback_person.dart';
 import '../../../data/models/survey_question_model.dart';
+import '../../../data/repositories/feedback_repository.dart';
 import '../../../data/repositories/survey_repository.dart';
 import '../../bloc/auth/auth_cubit.dart';
+import '../../widgets/feedback_comment_card.dart';
 import '../../widgets/loading_skeleton.dart';
 
 class SurveyScreen extends StatefulWidget {
-  const SurveyScreen({super.key});
+  /// `navigation_sessions.trip_id` of the trip this survey follows, if any.
+  final String? navigationSessionId;
+
+  const SurveyScreen({super.key, this.navigationSessionId});
 
   @override
   State<SurveyScreen> createState() => _SurveyScreenState();
@@ -18,7 +23,8 @@ class SurveyScreen extends StatefulWidget {
 
 class _SurveyScreenState extends State<SurveyScreen> {
   late final SurveyRepository _repo = context.read<SurveyRepository>();
-  final _commentController = TextEditingController();
+  late final FeedbackPerson _person =
+      feedbackPerson(context.read<AuthCubit>().state);
 
   List<SurveyQuestionModel> _questions = const [];
   bool _loading = true;
@@ -28,16 +34,13 @@ class _SurveyScreenState extends State<SurveyScreen> {
   bool _submitting = false;
   double? _score;
 
+  /// Answered before this screen opened: never asked twice.
+  bool _alreadyAnswered = false;
+
   @override
   void initState() {
     super.initState();
     _load();
-  }
-
-  @override
-  void dispose() {
-    _commentController.dispose();
-    super.dispose();
   }
 
   Future<void> _load() async {
@@ -46,12 +49,16 @@ class _SurveyScreenState extends State<SurveyScreen> {
       _error = null;
     });
     try {
-      final q = await _repo.getQuestions();
+      final answered = await _repo.hasSubmitted(userId: _person.userId);
+      final q = answered ? _questions : await _repo.getQuestions();
+      if (!mounted) return;
       setState(() {
+        _alreadyAnswered = answered;
         _questions = q;
         _loading = false;
       });
     } catch (_) {
+      if (!mounted) return;
       setState(() {
         _error = 'Could not load the survey.';
         _loading = false;
@@ -61,50 +68,71 @@ class _SurveyScreenState extends State<SurveyScreen> {
 
   bool get _isLast => _index == _questions.length - 1;
 
+  void _showMessage(String text) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(text)));
+  }
+
   Future<void> _submit() async {
-    setState(() => _submitting = true);
-    final ordered = List<int>.generate(
-      _questions.length,
-      (i) => _answers[i] ?? 3,
-    );
+    // Every question must be answered — never fill gaps with a default.
+    final ordered = List<int?>.generate(_questions.length, (i) => _answers[i]);
+    final firstMissing = ordered.indexOf(null);
+    if (firstMissing != -1) {
+      setState(() => _index = firstMissing);
+      _showMessage('Please answer question ${firstMissing + 1} first.');
+      return;
+    }
     final score = SurveyRepository.calculateSusScore(ordered);
+    if (score == null) {
+      _showMessage('Your answers could not be scored, so the survey was '
+          'not submitted.');
+      return;
+    }
+    setState(() => _submitting = true);
 
     final auth = context.read<AuthCubit>().state;
     String? userId;
     String? visitorId;
     String userType = 'visitor';
     if (auth is AuthAuthenticated) {
-      userId = Supabase.instance.client.auth.currentUser?.id;
+      userId = auth.user.id;
       userType = auth.user.roleLabel.isEmpty ? 'student' : auth.user.roleLabel;
     } else if (auth is AuthVisitor) {
       visitorId = auth.session.id.startsWith('local-') ? null : auth.session.id;
     }
 
+    bool sent;
     try {
-      await _repo.submitResponse(
+      sent = await _repo.submitResponse(
         userId: userId,
         visitorSessionId: visitorId,
-        answers: ordered,
+        answers: ordered.cast<int>(),
         susScore: score,
         userType: userType,
-        comment: _commentController.text.trim().isEmpty
-            ? null
-            : _commentController.text.trim(),
+        navigationSessionId: widget.navigationSessionId,
       );
     } catch (e) {
+      // Not even saved on the device — keep the answers on screen so the
+      // user can retry, and don't show a score as if it had been submitted.
+      debugPrint('Survey submit failed: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not submit — saved locally.')),
-        );
+        setState(() => _submitting = false);
+        _showMessage('Your feedback could not be saved. '
+            'Tap Submit to try again.');
       }
+      return;
     }
     if (mounted) {
       setState(() {
         _submitting = false;
         _score = score;
+        _queued = !sent;
       });
     }
   }
+
+  /// True when the response is saved on the device but not yet sent.
+  bool _queued = false;
 
   @override
   Widget build(BuildContext context) {
@@ -130,10 +158,15 @@ class _SurveyScreenState extends State<SurveyScreen> {
     if (_error != null) {
       return ErrorRetry(message: _error!, onRetry: _load);
     }
+    if (_alreadyAnswered) return const _AlreadyAnswered();
     if (_questions.isEmpty) {
       return const EmptyState(message: 'No survey questions available.');
     }
-    if (_score != null) return _ThankYou(score: _score!);
+    final setupProblem = SurveyRepository.susSetupProblem(_questions);
+    if (setupProblem != null) return EmptyState(message: setupProblem);
+    if (_score != null) {
+      return _ThankYou(score: _score!, queued: _queued, person: _person);
+    }
 
     final q = _questions[_index];
     final selected = _answers[_index];
@@ -197,16 +230,6 @@ class _SurveyScreenState extends State<SurveyScreen> {
                       fontSize: 11, color: AppColors.textSecondary)),
             ],
           ),
-          if (_isLast) ...[
-            const SizedBox(height: 24),
-            TextField(
-              controller: _commentController,
-              maxLines: 3,
-              decoration: const InputDecoration(
-                hintText: 'Any suggestions? (optional)',
-              ),
-            ),
-          ],
           const SizedBox(height: 28),
           ElevatedButton(
             onPressed: selected == null
@@ -237,9 +260,8 @@ class _SurveyScreenState extends State<SurveyScreen> {
   }
 }
 
-class _ThankYou extends StatelessWidget {
-  final double score;
-  const _ThankYou({required this.score});
+class _AlreadyAnswered extends StatelessWidget {
+  const _AlreadyAnswered();
 
   @override
   Widget build(BuildContext context) {
@@ -247,6 +269,38 @@ class _ThankYou extends StatelessWidget {
       padding: const EdgeInsets.all(28),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text("You've already answered this survey. Thank you!",
+              textAlign: TextAlign.center,
+              style: TextStyle(color: AppColors.textSecondary)),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: () => context.go('/map'),
+            child: const Text('Back to Map'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ThankYou extends StatelessWidget {
+  final double score;
+
+  /// Saved on the device, waiting for a connection.
+  final bool queued;
+  final FeedbackPerson person;
+  const _ThankYou({
+    required this.score,
+    required this.person,
+    this.queued = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(28),
+      child: Column(
         children: [
           const Icon(Icons.favorite, color: AppColors.errorRed, size: 64),
           const SizedBox(height: 16),
@@ -256,13 +310,26 @@ class _ThankYou extends StatelessWidget {
           const Text('Your feedback helps improve campus navigation.',
               textAlign: TextAlign.center,
               style: TextStyle(color: AppColors.textSecondary)),
+          if (queued) ...[
+            const SizedBox(height: 12),
+            const Text(
+                "You're offline, so your answers are saved on this phone. "
+                "They'll be sent automatically when you're back online.",
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.textSecondary)),
+          ],
           const SizedBox(height: 24),
           Text('SUS Score: ${score.toStringAsFixed(1)}',
               style: const TextStyle(
                   fontSize: 20,
                   fontWeight: FontWeight.w700,
                   color: AppColors.primaryMaroon)),
-          const SizedBox(height: 32),
+          const SizedBox(height: 24),
+          FeedbackCommentCard(
+            ratingContext: FeedbackRepository.afterSus,
+            person: person,
+          ),
+          const SizedBox(height: 24),
           ElevatedButton(
             onPressed: () => context.go('/map'),
             child: const Text('Back to Map'),

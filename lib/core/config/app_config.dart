@@ -1,3 +1,12 @@
+import 'package:flutter/foundation.dart';
+
+// Set to true right before deployment. Set back to false while gathering data and finishing the paper.
+const bool kBlockScreenCapture = false;
+
+/// The temporary coordinates overlay and the AR long-press tuning overlay.
+/// Debug builds only.
+const bool kDevCoordinateTools = kDebugMode;
+
 class AppConfig {
   AppConfig._();
 

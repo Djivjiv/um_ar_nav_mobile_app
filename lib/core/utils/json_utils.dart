@@ -34,6 +34,24 @@ class J {
     return fallback;
   }
 
+  /// A row's `is_active`: false only when explicitly false — a missing
+  /// column, null or unreadable value counts as active.
+  static bool isActiveRow(Map<String, dynamic> row) =>
+      boolOr(row['is_active'], true);
+
+  /// [rows] without the inactive ones (see [isActiveRow]).
+  static List<Map<String, dynamic>> activeRows(Iterable<dynamic> rows) => [
+        for (final r in rows)
+          if (r is Map<String, dynamic> && isActiveRow(r)) r,
+      ];
+
+  /// The `id`s of rows explicitly marked inactive.
+  static Set<int> inactiveIds(Iterable<dynamic> rows) => {
+        for (final r in rows)
+          if (r is Map<String, dynamic> && !isActiveRow(r))
+            if (intN(r['id']) case final int id) id,
+      };
+
   /// Parses a Postgres/JSON array (or a comma / brace string) into `List<String>`.
   static List<String> strList(dynamic v) {
     if (v == null) return const [];

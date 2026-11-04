@@ -1,19 +1,21 @@
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../../core/utils/device_utils.dart';
-import '../../../core/utils/session_service.dart';
 import '../../../data/models/user_profile_model.dart';
+import '../../../data/models/visitor_session_model.dart';
 import '../../../data/repositories/auth_repository.dart';
 import '../../../data/repositories/repository_exception.dart';
+import '../../../data/repositories/visitor_session_repository.dart';
 
 part 'auth_state.dart';
 
 class AuthCubit extends Cubit<AuthState> {
   final AuthRepository _repo;
+  final VisitorSessionRepository _visitors;
 
-  AuthCubit(this._repo) : super(const AuthInitial());
+  AuthCubit(this._repo, {VisitorSessionRepository? visitors})
+      : _visitors = visitors ?? VisitorSessionRepository(),
+        super(const AuthInitial());
 
   AuthRepository get repo => _repo;
 
@@ -34,10 +36,46 @@ class AuthCubit extends Cubit<AuthState> {
       emit(const AuthUnauthenticated());
       return false;
     }
-    emit(profile.hasRole
-        ? AuthAuthenticated(profile)
-        : AuthNeedsRoleSelection(profile));
+    await _emitForProfile(profile);
     return true;
+  }
+
+  /// The one place a profile becomes a state, so an account can't get in by
+  /// any route without passing the same checks. A rejected or inactive
+  /// account is signed out; a pending one stays signed in to check again.
+  Future<void> _emitForProfile(UserProfileModel profile) async {
+    final access = profile.access;
+    switch (access) {
+      case AccountAccess.allowed:
+        emit(AuthAuthenticated(profile));
+      case AccountAccess.needsRole:
+        emit(AuthNeedsRoleSelection(profile));
+      case AccountAccess.pending:
+        emit(AuthAccountBlocked(access, profile));
+      case AccountAccess.rejected:
+      case AccountAccess.inactive:
+        try {
+          await _repo.signOut();
+        } catch (e) {
+          debugPrint('Sign-out of a blocked account failed: $e');
+        }
+        emit(AuthAccountBlocked(access, profile));
+    }
+  }
+
+  /// Reads the profile again: "Check again" on the pending screen, and each
+  /// return to the app, so a decision by an admin takes effect without a new
+  /// sign-in. Without a profile (signed out, nothing cached) nothing changes.
+  Future<void> recheckAccess() async {
+    final current = state;
+    if (current is! AuthAuthenticated && current is! AuthAccountBlocked) return;
+    final profile = await _repo.getProfile();
+    if (profile == null) return;
+    if (current is AuthAuthenticated &&
+        profile.access == AccountAccess.allowed) {
+      return;
+    }
+    await _emitForProfile(profile);
   }
 
   Future<void> signInWithGoogle() async {
@@ -49,10 +87,7 @@ class AuthCubit extends Cubit<AuthState> {
     }
     switch (result.status) {
       case GoogleSignInStatus.success:
-        final profile = result.profile!;
-        emit(result.needsRoleSelection
-            ? AuthNeedsRoleSelection(profile)
-            : AuthAuthenticated(profile));
+        await _emitForProfile(result.profile!);
       case GoogleSignInStatus.cancelled:
         emit(const AuthUnauthenticated());
       case GoogleSignInStatus.wrongDomain:
@@ -67,128 +102,81 @@ class AuthCubit extends Cubit<AuthState> {
 
   Future<void> selectRole(String role) async {
     final current = state;
-    if (current is! AuthNeedsRoleSelection) return;
-    emit(const AuthLoading());
+    if (current is! AuthNeedsRoleSelection || current.saving) return;
+    const failed = 'Could not save your role. Please try again.';
+    emit(AuthNeedsRoleSelection(current.user, saving: true));
     try {
       final profile = await _repo.updateRole(role);
       if (profile != null && profile.hasRole) {
-        emit(AuthAuthenticated(profile));
+        await _emitForProfile(profile);
       } else {
-        emit(AuthNeedsRoleSelection(current.user));
-        emit(const AuthError('Could not save your role. Please try again.'));
+        emit(AuthNeedsRoleSelection(current.user, error: failed));
       }
     } on RepositoryException catch (e) {
-      emit(AuthNeedsRoleSelection(current.user));
-      emit(AuthError(e.message));
+      emit(AuthNeedsRoleSelection(current.user, error: e.message));
+    } catch (e) {
+      debugPrint('Role not saved: $e');
+      emit(AuthNeedsRoleSelection(current.user, error: failed));
     }
   }
 
-  Future<void> signIn(String email, String password) async {
-    emit(const AuthLoading());
-    try {
-      final res = await _repo.signInWithEmail(email, password);
-      if (res.needsEmailVerification) {
-        emit(AuthNeedsVerification(email));
-        return;
-      }
-      if (res.profile != null) {
-        emit(AuthAuthenticated(res.profile!));
-      } else {
-        emit(const AuthError('Sign in failed. Please try again.'));
-      }
-    } on RepositoryException catch (e) {
-      emit(AuthError(e.message));
-    } catch (_) {
-      emit(const AuthError('Something went wrong. Please try again.'));
-    }
-  }
-
-  Future<void> register(
-      String email, String password, String fullName) async {
-    emit(const AuthLoading());
-    try {
-      await _repo.registerWithEmail(email, password, fullName);
-      emit(AuthNeedsVerification(email));
-    } on RepositoryException catch (e) {
-      emit(AuthError(e.message));
-    } catch (_) {
-      emit(const AuthError('Registration failed. Please try again.'));
-    }
-  }
-
-  Future<void> resendVerification(String email) async {
-    try {
-      await _repo.resendVerification(email);
-    } on RepositoryException catch (e) {
-      emit(AuthError(e.message));
-    }
-  }
-
-  /// Called from the verify-email screen after the user confirms.
-  Future<void> refreshAfterVerification() async {
-    emit(const AuthLoading());
-    final profile = await _repo.getProfile();
-    if (profile != null && profile.isAllowed && !profile.isAdmin) {
-      emit(AuthAuthenticated(profile));
-    } else {
-      emit(const AuthUnauthenticated());
-    }
-  }
-
+  /// Starts a visitor session, or carries on with the one still running.
+  /// Each session of a device has the same `device_code`.
   Future<void> continueAsVisitor() async {
     emit(const AuthLoading());
     try {
-      final deviceId = await DeviceUtils.getDeviceId();
-      final sessionId = await SessionService.createVisitorSession(deviceId);
-      if (sessionId == null) {
-        emit(const AuthError(
-            'Failed to start visitor session. Please try again.'));
-        return;
-      }
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('visitor_session_id', sessionId);
-
-      final model = await _buildVisitorModel(sessionId, deviceId);
-      emit(AuthVisitor(model));
+      final session = await _visitors.start();
+      emit(session == null
+          ? const AuthError(
+              'Failed to start visitor session. Please try again.')
+          : AuthVisitor(session));
     } catch (e) {
       emit(const AuthError('Something went wrong. Please try again.'));
       debugPrint('Visitor session error: $e');
     }
   }
 
-  /// Rebuilds [AuthVisitor] from a stored `visitor_session_id` on launch.
+  /// Rebuilds [AuthVisitor] from the saved session on launch. A saved session
+  /// that ran out while the app was closed ends the same way as one that runs
+  /// out in use.
   Future<bool> restoreVisitorSession() async {
-    final prefs = await SharedPreferences.getInstance();
-    final sessionId = prefs.getString('visitor_session_id');
-    if (sessionId == null) return false;
-
-    final valid = await SessionService.isVisitorSessionValid(sessionId);
-    if (!valid) {
-      await prefs.remove('visitor_session_id');
+    final session = await _visitors.restore();
+    if (session == null) return false;
+    if (!session.isStillValid) {
+      await endVisitorSession();
       return false;
     }
-    final deviceId = await DeviceUtils.getDeviceId();
-    emit(AuthVisitor(await _buildVisitorModel(sessionId, deviceId)));
+    emit(AuthVisitor(session));
     return true;
   }
 
-  Future<VisitorSessionModel> _buildVisitorModel(
-      String sessionId, String deviceId) async {
-    final minutes =
-        await SessionService.getVisitorRemainingMinutes(sessionId);
-    final now = DateTime.now();
-    return VisitorSessionModel(
-      id: sessionId,
-      deviceId: deviceId,
-      startedAt: now,
-      expiresAt: now.add(Duration(minutes: minutes)),
-    );
+  /// Checks the running visitor session, and ends it when its time is up or
+  /// the server has closed it. `VisitorExpiryWatcher` calls this all the time.
+  Future<void> checkVisitorSession() async {
+    final current = state;
+    if (current is! AuthVisitor || _checkingVisitor) return;
+    // One at a time: a slow check finishing after another ended the session
+    // would save it again.
+    _checkingVisitor = true;
+    try {
+      final session = await _visitors.refresh(current.session);
+      if (state is! AuthVisitor) return;
+      if (!session.isStillValid) {
+        await endVisitorSession();
+      } else if (session.expiresAt != current.session.expiresAt) {
+        emit(AuthVisitor(session));
+      }
+    } finally {
+      _checkingVisitor = false;
+    }
   }
 
-  /// Checks whether the current visitor session is still within its 2h window.
-  bool get isVisitorSessionValid {
-    final s = state;
-    return s is AuthVisitor && s.session.isStillValid;
+  bool _checkingVisitor = false;
+
+  /// Signs the visitor out and removes everything of the session.
+  Future<void> endVisitorSession() async {
+    await _visitors.clear();
+    emit(const AuthVisitorEnded());
   }
 
   Future<void> signOut() async {

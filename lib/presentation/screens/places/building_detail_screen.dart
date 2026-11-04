@@ -7,8 +7,9 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/building_icon_map.dart';
 import '../../bloc/building/building_cubit.dart';
-import '../../bloc/navigation/outdoor_nav_cubit.dart';
+import '../../widgets/floor_plans_button.dart';
 import '../../widgets/loading_skeleton.dart';
+import '../../widgets/route_start_picker.dart';
 
 class BuildingDetailScreen extends StatefulWidget {
   final int buildingId;
@@ -129,13 +130,17 @@ class _BuildingDetailScreenState extends State<BuildingDetailScreen> {
                       ],
                       const SizedBox(height: 24),
                       ElevatedButton.icon(
-                        onPressed: () {
-                          context.read<OutdoorNavCubit>().routeToBuilding(b);
-                          context.go('/map');
+                        onPressed: () async {
+                          // GPS start, else the user picks one — never a
+                          // guessed start node.
+                          final started =
+                              await startRouteToBuilding(context, b);
+                          if (started && context.mounted) context.go('/map');
                         },
                         icon: const Icon(Icons.directions),
                         label: const Text('Navigate Here'),
                       ),
+                      FloorPlansButton(buildingId: widget.buildingId),
                     ],
                   ),
                 ),

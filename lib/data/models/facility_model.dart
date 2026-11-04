@@ -10,6 +10,10 @@ class FacilityModel {
   final List<String> description;
   final String? location;
   final String? officeHours;
+
+  /// `facilities.access_level` when the column exists (e.g. `staff_only`);
+  /// null when missing or empty. Raw — see `accessRestriction` for display.
+  final String? accessLevel;
   final FacilityDetailsModel? details;
 
   const FacilityModel({
@@ -22,6 +26,7 @@ class FacilityModel {
     this.description = const [],
     this.location,
     this.officeHours,
+    this.accessLevel,
     this.details,
   });
 
@@ -37,6 +42,7 @@ class FacilityModel {
       description: J.strList(m['description']),
       location: J.str(m['location']),
       officeHours: J.str(m['office_hours']),
+      accessLevel: J.str(m['access_level']),
       details: details,
     );
   }

@@ -5,21 +5,32 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:supabase_flutter/supabase_flutter.dart' show Supabase;
 
+import '../../../core/config/app_config.dart';
 import '../../../core/config/maptiler_config.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/indoor_route_helpers.dart';
 import '../../../core/utils/navigation_phase_manager.dart';
 import '../../../core/utils/navigation_preference.dart';
 import '../../../data/models/building_model.dart';
+import '../../../data/models/floor_plan_model.dart';
+import '../../../data/models/indoor_node_model.dart';
 import '../../../data/models/outdoor_node_model.dart';
+import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/facility_repository.dart';
+import '../../../data/repositories/floor_plan_repository.dart';
+import '../../../data/repositories/indoor_navigation_repository.dart';
+import '../../../data/repositories/room_repository.dart';
 import '../../../domain/services/dijkstra_service.dart';
 import '../../bloc/building/building_cubit.dart';
 import '../../bloc/navigation/outdoor_nav_cubit.dart';
 import '../../bloc/search/search_cubit.dart';
 import '../../widgets/building_bottom_sheet.dart';
+import '../../widgets/dev_coordinate_panel.dart';
+import '../../widgets/floor_plans_button.dart';
 import '../../widgets/navigation_path_painter.dart';
 import '../../widgets/route_info_panel.dart';
+import '../../widgets/route_start_picker.dart';
 import '../../widgets/um_map_widget.dart';
 import '../../../services/unity_bridge_service.dart';
 import '../ar/ar_navigation_screen.dart';
@@ -27,8 +38,51 @@ import '../ar/unity_ar_screen.dart';
 import '../navigation/multi_phase_nav_screen.dart';
 import 'search_destination_page.dart';
 
+/// The journey for a found route. The route's last node is the entrance the
+/// user arrives at, which is where an indoor leg has to start.
+NavigationRoute outdoorTripRoute({
+  required Map<String, dynamic> from,
+  required Map<String, dynamic> to,
+  required OutdoorNavState navState,
+  String? originBuildingId,
+  String? originBuildingName,
+  String? destBuildingId,
+  String? destBuildingName,
+  bool hasElevator = false,
+}) {
+  int? destFloor;
+  final rawFloor = to['floor'];
+  if (rawFloor is int) {
+    destFloor = rawFloor;
+  } else if (rawFloor != null) {
+    destFloor = int.tryParse(rawFloor.toString());
+  }
+
+  return NavigationRoute(
+    from: from,
+    to: to,
+    phases: NavigationRoute.determinePhases(from: from, to: to),
+    originBuildingId: originBuildingId,
+    originBuildingName: originBuildingName,
+    originRoomName: from['name'] as String?,
+    destBuildingId: destBuildingId,
+    destBuildingName: destBuildingName,
+    destRoomName: to['name'] as String?,
+    destFloor: destFloor,
+    outdoorPath: navState.path,
+    arrivalOutdoorNodeId: navState.pathNodeIds.lastOrNull,
+    fromName: navState.from?.label,
+    toName: navState.to?.label,
+    distanceMeters: navState.distanceMeters,
+    estimatedMinutes: navState.walkMinutes,
+    hasElevator: hasElevator,
+  );
+}
+
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+  final bool devTools;
+
+  const MapScreen({super.key, this.devTools = kDevCoordinateTools});
 
   @override
   State<MapScreen> createState() => _MapScreenState();
@@ -42,6 +96,12 @@ class _MapScreenState extends State<MapScreen> {
   bool _isLoadingDestinations = false;
   Map<String, dynamic>? _selectedFrom;
   Map<String, dynamic>? _selectedTo;
+
+  /// Waiting for GPS, for "My location" as the start.
+  bool _locating = false;
+
+  /// Why "My location" could not be used, shown in the route planner.
+  String? _startProblem;
 
   /// Room → room in the SAME building: no outdoor leg, so the review panel
   /// is driven from here instead of the OutdoorNavCubit.
@@ -95,9 +155,6 @@ class _MapScreenState extends State<MapScreen> {
     final to = _selectedTo ??
         {'type': 'building', 'name': navState.to?.label ?? 'Destination'};
 
-    final phases =
-        NavigationRoute.determinePhases(from: from, to: to);
-
     // Destination building id + elevator check.
     final destBuildingId = to['type'] == 'building'
         ? to['id']?.toString()
@@ -105,15 +162,9 @@ class _MapScreenState extends State<MapScreen> {
 
     var hasElevator = false;
     if (destBuildingId != null) {
-      try {
-        final rows = await Supabase.instance.client
-            .from('indoor_nodes')
-            .select('id')
-            .eq('building_id', destBuildingId)
-            .eq('label', 'elevator')
-            .limit(1);
-        hasElevator = (rows as List).isNotEmpty;
-      } catch (_) {}
+      hasElevator = await context
+          .read<IndoorNavigationRepository>()
+          .buildingHasElevator(destBuildingId);
     }
     if (!mounted) return;
 
@@ -121,34 +172,18 @@ class _MapScreenState extends State<MapScreen> {
         ? from['id']?.toString()
         : from['building_id']?.toString();
 
-    int? destFloor;
-    final rawFloor = to['floor'];
-    if (rawFloor is int) {
-      destFloor = rawFloor;
-    } else if (rawFloor != null) {
-      destFloor = int.tryParse(rawFloor.toString());
-    }
-
-    final route = NavigationRoute(
+    final route = outdoorTripRoute(
       from: from,
       to: to,
-      phases: phases,
+      navState: navState,
       originBuildingId: fromBuildingId,
       originBuildingName: from['type'] == 'building'
           ? (from['name'] as String?)
           : _buildingNameFor(fromBuildingId),
-      originRoomName: from['name'] as String?,
       destBuildingId: destBuildingId,
       destBuildingName: to['type'] == 'building'
           ? (to['name'] as String?)
           : _buildingNameFor(destBuildingId),
-      destRoomName: to['name'] as String?,
-      destFloor: destFloor,
-      outdoorPath: navState.path,
-      fromName: navState.from?.label,
-      toName: navState.to?.label,
-      distanceMeters: navState.distanceMeters,
-      estimatedMinutes: navState.walkMinutes,
       hasElevator: hasElevator,
     );
 
@@ -167,8 +202,9 @@ class _MapScreenState extends State<MapScreen> {
     final toName = navState.to?.label ??
         _selectedTo?['name'] as String? ??
         'Destination';
-    final buildingId =
-        _selectedTo != null ? _buildingIdFor(_selectedTo!)?.toString() : null;
+    final destBuildingId =
+        _selectedTo != null ? _buildingIdFor(_selectedTo!) : null;
+    final buildingId = destBuildingId?.toString();
     final useUnity = await UnityBridgeService.instance.isAvailable();
     if (!mounted) return;
 
@@ -182,6 +218,7 @@ class _MapScreenState extends State<MapScreen> {
                 fromName: fromName,
                 distanceMeters: navState.distanceMeters,
                 destinationLatLng: navState.path.last,
+                routeNodeIds: navState.pathNodeIds,
               )
             : ARNavigationScreen(
                 routePoints: navState.path,
@@ -189,6 +226,11 @@ class _MapScreenState extends State<MapScreen> {
                 toName: toName,
                 distanceMeters: navState.distanceMeters,
                 destinationLatLng: navState.path.last,
+                routeNodeIds: navState.pathNodeIds,
+                destinationBuildingId: destBuildingId,
+                // Room / facility destinations get their own info card.
+                destinationType: _selectedTo?['type']?.toString(),
+                destinationId: _selectedTo?['id']?.toString(),
               ),
       ),
     );
@@ -466,6 +508,8 @@ class _MapScreenState extends State<MapScreen> {
                     ),
                   ),
                 ),
+                if (type == 'building' && _buildingIdFor(place) != null)
+                  FloorPlansButton(buildingId: _buildingIdFor(place)!),
                 const SizedBox(height: 8),
               ],
             ),
@@ -555,33 +599,29 @@ class _MapScreenState extends State<MapScreen> {
     if (_allDestinations.isNotEmpty) return;
     setState(() => _isLoadingDestinations = true);
 
-    final supabase = Supabase.instance.client;
     final destinations = <Map<String, dynamic>>[];
 
     try {
-      final buildings = await supabase
-          .from('buildings')
-          .select('id, name, short_name, lat, lng')
-          .not('lat', 'is', null)
-          .order('name');
+      // Repositories fall back to the saved offline copy without a connection.
+      final buildings = await context.read<BuildingRepository>().getBuildings();
+      if (!mounted) return;
+      final roomRepo = context.read<RoomRepository>();
+      final facilityRepo = context.read<FacilityRepository>();
 
       for (final b in buildings) {
         destinations.add({
-          'id': b['id'].toString(),
-          'name': b['name']?.toString() ?? 'Building',
+          'id': b.id.toString(),
+          'name': b.name,
           'subtitle': 'Building',
           'type': 'building',
-          'lat': b['lat'],
-          'lng': b['lng'],
+          'lat': b.lat,
+          'lng': b.lng,
           'icon': Icons.business,
           'color': AppColors.primaryMaroon,
         });
       }
 
-      final rooms = await supabase
-          .from('rooms')
-          .select('id, roomname, floor, building_id, buildings(name)')
-          .order('roomname');
+      final rooms = await roomRepo.getAllRoomRows();
 
       for (final r in rooms) {
         final buildingName =
@@ -599,11 +639,7 @@ class _MapScreenState extends State<MapScreen> {
         });
       }
 
-      final facilities = await supabase
-          .from('facilities')
-          .select(
-              'id, roomname, room_number, floor, building_id, buildings(name)')
-          .order('roomname');
+      final facilities = await facilityRepo.getAllFacilityRows();
 
       for (final f in facilities) {
         final buildingName =
@@ -641,6 +677,8 @@ class _MapScreenState extends State<MapScreen> {
   Future<void> _showRoutePlanner({bool keepTo = false}) async {
     // Always reset the origin; keep a pre-filled destination when asked.
     _selectedFrom = null;
+    _startProblem = null;
+    _locating = false;
     if (!keepTo) _selectedTo = null;
     if (_indoorRoute != null) setState(() => _indoorRoute = null);
     if (_allDestinations.isEmpty) {
@@ -715,22 +753,36 @@ class _MapScreenState extends State<MapScreen> {
                                 selected: _selectedFrom,
                                 hint: 'Select starting point',
                                 onTap: () async {
-                                  final result =
-                                      await _showSearchSheet(context);
+                                  final result = await _showSearchSheet(
+                                      context,
+                                      pinned: myLocationPlace);
                                   if (result != null) {
-                                    setSheetState(
-                                        () => _selectedFrom = result);
+                                    setSheetState(() {
+                                      _selectedFrom = result;
+                                      _startProblem = null;
+                                    });
                                   }
                                 },
                               ),
+                              if (_startProblem != null) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                    '$_startProblem Choose a starting point.',
+                                    style: const TextStyle(
+                                        fontSize: 12,
+                                        color: AppColors.errorRed)),
+                              ],
                               const SizedBox(height: 8),
                               Center(
                                 child: GestureDetector(
-                                  onTap: () => setSheetState(() {
-                                    final temp = _selectedFrom;
-                                    _selectedFrom = _selectedTo;
-                                    _selectedTo = temp;
-                                  }),
+                                  // "My location" is only ever a start.
+                                  onTap: isMyLocation(_selectedFrom)
+                                      ? null
+                                      : () => setSheetState(() {
+                                            final temp = _selectedFrom;
+                                            _selectedFrom = _selectedTo;
+                                            _selectedTo = temp;
+                                          }),
                                   child: Container(
                                     width: 36,
                                     height: 36,
@@ -771,17 +823,18 @@ class _MapScreenState extends State<MapScreen> {
                                 height: 52,
                                 child: ElevatedButton.icon(
                                   onPressed: (_selectedFrom != null &&
-                                          _selectedTo != null)
-                                      ? () {
-                                          Navigator.pop(context);
-                                          _findRoute(_selectedFrom!,
-                                              _selectedTo!);
-                                        }
+                                          _selectedTo != null &&
+                                          !_locating)
+                                      ? () => _submitRoute(
+                                          context, setSheetState)
                                       : null,
                                   icon: const Icon(Icons.directions,
                                       color: AppColors.accentGold),
-                                  label: const Text('Find Route',
-                                      style: TextStyle(
+                                  label: Text(
+                                      _locating
+                                          ? 'Finding your location…'
+                                          : 'Find Route',
+                                      style: const TextStyle(
                                           color: AppColors.accentGold,
                                           fontWeight: FontWeight.bold,
                                           fontSize: 16)),
@@ -880,7 +933,51 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  Future<Map<String, dynamic>?> _showSearchSheet(BuildContext context) {
+  /// Closes the planner and finds the route. A "My location" start is
+  /// located first; if it can't be, the planner stays open and says why.
+  Future<void> _submitRoute(
+      BuildContext sheetContext, StateSetter setSheetState) async {
+    if (isMyLocation(_selectedFrom)) {
+      setSheetState(() {
+        _locating = true;
+        _startProblem = null;
+      });
+      final start = await locateStartNode(context.read<OutdoorNavCubit>());
+      if (!mounted || !sheetContext.mounted) return;
+      final node = start.node;
+      setSheetState(() {
+        _locating = false;
+        if (node == null) {
+          _startProblem = start.problem;
+          _selectedFrom = null;
+        } else {
+          _selectedFrom = _myLocationAt(node, _selectedTo!);
+        }
+      });
+      if (node == null) return;
+    }
+    Navigator.pop(sheetContext);
+    _findRoute(_selectedFrom!, _selectedTo!);
+  }
+
+  /// [myLocationPlace] resolved to [node]. Standing at an entrance of the
+  /// destination's building and heading for a room there, the user is
+  /// already at that building, so there is no outdoor leg to walk.
+  Map<String, dynamic> _myLocationAt(
+      OutdoorNodeModel node, Map<String, dynamic> to) {
+    return {
+      ...myLocationPlace,
+      'lat': node.lat,
+      'lng': node.lng,
+      if (to['type'] != 'building' &&
+          node.buildingId != null &&
+          node.buildingId == _buildingIdFor(to))
+        'id': node.buildingId.toString(),
+    };
+  }
+
+  Future<Map<String, dynamic>?> _showSearchSheet(BuildContext context,
+      {Map<String, dynamic>? pinned}) {
     // Push on the ROOT navigator so the full-screen search page covers the
     // shell (the floating search bar, bottom nav and DEV banner live there),
     // instead of the shell navigator where the map's overlays stay on top.
@@ -890,6 +987,7 @@ class _MapScreenState extends State<MapScreen> {
         fullscreenDialog: true,
         builder: (_) => SearchDestinationPage(
           destinations: _allDestinations,
+          pinned: pinned,
         ),
       ),
     );
@@ -1005,61 +1103,64 @@ class _MapScreenState extends State<MapScreen> {
 
   /// Rough indoor distance (metres) + walk seconds between two rooms in the
   /// same building — straight-line node-to-node on the origin floor, scaled by
-  /// `building_floors.scale_factor`, plus ~15 m per floor when they differ.
+  /// the floor's metres per pixel ([FloorPlanModel.effectiveMetersPerPixel]),
+  /// plus ~15 m per floor when they differ.
   Future<({double meters, int seconds})> _indoorRouteEstimate({
     required String buildingId,
     String? fromRoomId,
     String? toRoomId,
+    String? fromType,
+    String? toType,
     required int fromFloor,
     required int toFloor,
   }) async {
     var meters = 0.0;
+    final floorRepo = context.read<FloorPlanRepository>();
+    final indoorRepo = context.read<IndoorNavigationRepository>();
     try {
-      final supabase = Supabase.instance.client;
-      final floorPlan = await supabase
-          .from('building_floors')
-          .select('id, scale_factor')
-          .eq('building_id', buildingId)
-          .eq('floor_number', fromFloor <= 1 ? 1 : fromFloor)
-          .eq('is_active', true)
-          .maybeSingle();
+      // Repositories fall back to the saved offline copy without a connection.
+      final bId = int.tryParse(buildingId);
+      final floors =
+          bId == null ? const <FloorPlanModel>[] : await floorRepo.getFloorsForBuilding(bId);
+      final target = fromFloor <= 1 ? 1 : fromFloor;
+      FloorPlanModel? floorPlan;
+      for (final f in floors) {
+        if (f.floorNumber == target) {
+          floorPlan = f;
+          break;
+        }
+      }
 
       if (floorPlan != null) {
-        final rows = await supabase
-            .from('indoor_nodes')
-            .select('x, y, is_entrance, is_navigable, linked_room_id')
-            .eq('floor_plan_id', floorPlan['id']);
-        final nodes = (rows as List)
-            .cast<Map<String, dynamic>>()
-            .where((n) => n['is_navigable'] != false)
+        final nodes = (await indoorRepo.getNodesForFloor(floorPlan.id.toString()))
+            .where((n) => n.isNavigable)
             .toList();
 
         if (nodes.isNotEmpty) {
-          Map<String, dynamic>? linked(String? roomId) {
+          // Room and facility ids can collide — match linked_table too.
+          IndoorNodeModel? linked(String? roomId, String? type) {
             if (roomId == null) return null;
             for (final n in nodes) {
-              if (n['linked_room_id']?.toString() == roomId) return n;
+              if (nodeLinksTo(n, roomId, type)) return n;
             }
             return null;
           }
 
-          Map<String, dynamic> entranceOrFirst() {
+          IndoorNodeModel entranceOrFirst() {
             for (final n in nodes) {
-              if (n['is_entrance'] == true) return n;
+              if (n.isEntrance) return n;
             }
             return nodes.first;
           }
 
-          final fromNode = linked(fromRoomId) ?? entranceOrFirst();
-          final toNode = linked(toRoomId) ?? nodes.last;
+          final fromNode = linked(fromRoomId, fromType) ?? entranceOrFirst();
+          final toNode = linked(toRoomId, toType) ?? nodes.last;
 
-          double d(dynamic v) => (v as num?)?.toDouble() ?? 0;
-          final dx = d(fromNode['x']) - d(toNode['x']);
-          final dy = d(fromNode['y']) - d(toNode['y']);
+          final dx = fromNode.x - toNode.x;
+          final dy = fromNode.y - toNode.y;
           final pixels = math.sqrt(dx * dx + dy * dy);
 
-          final scale = (floorPlan['scale_factor'] as num?)?.toDouble() ?? 0;
-          meters = pixels * (scale > 0 && scale < 0.5 ? scale : 0.05);
+          meters = pixels * floorPlan.effectiveMetersPerPixel;
         }
       }
     } catch (e) {
@@ -1072,20 +1173,8 @@ class _MapScreenState extends State<MapScreen> {
     return (meters: meters, seconds: (meters / 0.8).ceil());
   }
 
-  Future<bool> _buildingHasElevator(String buildingId) async {
-    try {
-      final rows = await Supabase.instance.client
-          .from('indoor_nodes')
-          .select('id')
-          .eq('building_id', buildingId)
-          .eq('label', 'elevator')
-          .limit(1);
-      return (rows as List).isNotEmpty;
-    } catch (e) {
-      debugPrint('Elevator check failed: $e');
-      return false;
-    }
-  }
+  Future<bool> _buildingHasElevator(String buildingId) =>
+      context.read<IndoorNavigationRepository>().buildingHasElevator(buildingId);
 
   Future<void> _findRoute(
       Map<String, dynamic> from, Map<String, dynamic> to) async {
@@ -1095,16 +1184,16 @@ class _MapScreenState extends State<MapScreen> {
 
     setState(() => _indoorRoute = null);
 
-    // ── Same building, indoor → indoor: skip the outdoor leg entirely. ──
-    final fromType = (from['type'] ?? 'building').toString();
+    // ── Same building, to a room: skip the outdoor leg entirely. ──
+    // From a room the trip starts there; from the building itself the indoor
+    // screen works out the entrance.
     final toType = (to['type'] ?? 'building').toString();
     final fromBId = _buildingIdFor(from);
     final toBId = _buildingIdFor(to);
     final sameBuilding = fromBId != null && toBId != null && fromBId == toBId;
-    final bothIndoor = (fromType == 'room' || fromType == 'facility') &&
-        (toType == 'room' || toType == 'facility');
+    final toIndoor = toType == 'room' || toType == 'facility';
 
-    if (sameBuilding && bothIndoor) {
+    if (sameBuilding && toIndoor) {
       final fromFloor = _floorOf(from);
       final toFloor = _floorOf(to);
       debugPrint('🏢 Same building ($fromBId) — indoor navigation only '
@@ -1115,6 +1204,8 @@ class _MapScreenState extends State<MapScreen> {
         fromRoomId:
             from['type'] != 'building' ? from['id']?.toString() : null,
         toRoomId: to['type'] != 'building' ? to['id']?.toString() : null,
+        fromType: from['type']?.toString(),
+        toType: to['type']?.toString(),
         fromFloor: fromFloor ?? 1,
         toFloor: toFloor ?? 1,
       );
@@ -1162,8 +1253,6 @@ class _MapScreenState extends State<MapScreen> {
     // is_entrance being populated.
     final fromLatLng = _latLngFor(from);
     final toLatLng = _latLngFor(to);
-    debugPrint('   fromLatLng: $fromLatLng');
-    debugPrint('   toLatLng:   $toLatLng');
     if (fromLatLng == null || toLatLng == null) {
       _routeSnack('Could not resolve those locations on the map.');
       return;
@@ -1242,6 +1331,9 @@ class _MapScreenState extends State<MapScreen> {
       toNodeId: toNodeId,
       fromName: from['name'] as String,
       toName: to['name'] as String,
+      toType: to['type']?.toString(),
+      toId: to['id']?.toString(),
+      toBuildingId: toBuildingId,
     );
     if (!mounted) return;
     final s = nav.state;
@@ -1353,6 +1445,13 @@ class _MapScreenState extends State<MapScreen> {
             },
           ),
 
+          if (widget.devTools)
+            Positioned(
+              top: MediaQuery.paddingOf(context).top + 76,
+              left: 8,
+              child: const DevLiveCoordinatePanel(),
+            ),
+
           // Recenter + route-planner FABs, just above the bottom nav bar.
           // Hidden while the route info panel is showing.
           BlocBuilder<OutdoorNavCubit, OutdoorNavState>(
@@ -1443,7 +1542,9 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Widget _indoorRoutePanel(NavigationRoute route) {
-    final sameFloor = route.originFloor == route.destFloor;
+    // No origin floor = coming from an entrance, chosen when the trip starts.
+    final sameFloor =
+        route.originFloor == null || route.originFloor == route.destFloor;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -1563,7 +1664,7 @@ class _MapScreenState extends State<MapScreen> {
               Container(width: 1, height: 30, color: Colors.grey[300]),
               _indoorStat(
                 sameFloor
-                    ? 'Floor ${route.originFloor ?? 1}'
+                    ? 'Floor ${route.destFloor ?? 1}'
                     : 'F${route.originFloor ?? 1}→F${route.destFloor ?? 1}',
                 'floors',
                 AppColors.infoBlue,
